@@ -1,12 +1,15 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <fstream>
 #include <iostream>
 #include <print>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -245,6 +248,48 @@ void collect_ipv4_benchmark_results(size_t number_strings) {
   pretty_print("ada", number_strings, counters::bench(count_ada));
 }
 
+// Scalar reference serializer from ada-url, included here for comparison.
+// Digit pair LUT for fast decimal write: index 0..99 -> two chars.
+constexpr std::array<char, 200> make_digit_pairs() noexcept {
+  std::array<char, 200> t{};
+  for (size_t i = 0; i < 100; ++i) {
+    t[i * 2] = static_cast<char>('0' + i / 10);
+    t[i * 2 + 1] = static_cast<char>('0' + i % 10);
+  }
+  return t;
+}
+
+constexpr auto digit_pairs = make_digit_pairs();
+
+// Writes the decimal representation of an octet (0..255); returns the new
+// write position. Reconstructed to match ada-url's digit_pairs LUT usage.
+inline char* write_u8(char* point, uint8_t value) {
+  if (value < 10) {
+    *point = static_cast<char>('0' + value);
+    return point + 1;
+  } else if (value < 100) {
+    std::memcpy(point, &digit_pairs[value * 2], 2);
+    return point + 2;
+  }
+  *point = static_cast<char>('0' + value / 100);
+  std::memcpy(point + 1, &digit_pairs[(value % 100) * 2], 2);
+  return point + 3;
+}
+
+// out needs at least 16 bytes; NUL-terminated on return. Returns the length.
+size_t ipv4(const uint64_t address, char* out) {
+  char* point = out;
+  point = write_u8(point, static_cast<uint8_t>(address >> 24));
+  *point++ = '.';
+  point = write_u8(point, static_cast<uint8_t>(address >> 16));
+  *point++ = '.';
+  point = write_u8(point, static_cast<uint8_t>(address >> 8));
+  *point++ = '.';
+  point = write_u8(point, static_cast<uint8_t>(address));
+  *point = '\0';
+  return static_cast<size_t>(point - out);
+}
+
 void collect_ipv4_serialize_benchmark(size_t number_values) {
   // Random 32-bit values to serialize (stored as four network-order octets).
   std::random_device rd;
@@ -288,6 +333,28 @@ void collect_ipv4_serialize_benchmark(size_t number_values) {
     counter = c;
   };
   pretty_print("SIMD (SSE multiply-add)", number_values, counters::bench(count_simd));
+  auto count_new = [&values, &counter]() {
+    size_t c = 0;
+    char buf[16];
+    for (uint32_t x : values) {
+        size_t n = new_ipv4_to_string(x, buf);
+        c += n + (uint8_t)buf[0];
+    }
+    counter = c;
+  };
+  pretty_print("new_ipv4_to_string (AVX-512 compress)", number_values, counters::bench(count_new));
+  auto count_ada = [&values, &counter]() {
+    size_t c = 0;
+    char buf[16];
+    for (uint32_t x : values) {
+        // ada's ipv4() takes a host-order integer (first octet in the high
+        // byte); values are network order, so byte-swap to feed the same address.
+        size_t n = ipv4(ntohl(x), buf);
+        c += n + (uint8_t)buf[0];
+    }
+    counter = c;
+  };
+  pretty_print("ada ipv4 (LUT, char*)", number_values, counters::bench(count_ada));
 #if defined(__AVX512IFMA__) && defined(__AVX512VBMI__)
   auto count_ifma = [&values, &counter]() {
     size_t c = 0;
@@ -358,7 +425,7 @@ void collect_ipv6_serialize_benchmark(size_t number_values) {
   pretty_print("serialize_ipv6", number_values, counters::bench(count_simd));
 }
 
-bool run_serialize_tests() {
+bool run_ipv4_serialize_tests() {
     // The SIMD serializer must match inet_ntop on every input. Octets are
     // independent, so we exhaustively vary each of the four positions across
     // 0..255 (with the others fixed) and add a large random cross-product
@@ -374,6 +441,12 @@ bool run_serialize_tests() {
         int nc = serialize_ipv4_scalar((const uint8_t*)&netorder, scal);
         bool bad = std::strcmp(simd, ref) != 0 || ns != (int)std::strlen(ref) ||
                    std::strcmp(scal, ref) != 0 || nc != ns;
+        // new_ipv4_to_string takes the packed value directly (byte 0 = first
+        // octet) and compress-fills the tail with zeros, so it is NUL-terminated.
+        char nw[16];
+        int nn = (int)new_ipv4_to_string(netorder, nw);
+        nw[nn] = '\0';
+        bad = bad || std::strcmp(nw, ref) != 0 || nn != ns;
 #if defined(__AVX512IFMA__) && defined(__AVX512VBMI__)
         char ifma[16], ifma8[16];
         int ni = serialize_ipv4_ifma((const uint8_t*)&netorder, ifma);
@@ -382,8 +455,8 @@ bool run_serialize_tests() {
               std::strcmp(ifma8, ref) != 0 || ni8 != ns;
 #endif
         if (bad) {
-            std::print("FAIL  ipv4 serialize: SIMD '{}' scalar '{}' want '{}'\n",
-                       simd, scal, ref);
+            std::print("FAIL  ipv4 serialize: SIMD '{}' scalar '{}' new '{}' want '{}'\n",
+                       simd, scal, nw, ref);
             all_ok = false;
         }
     };
@@ -403,9 +476,13 @@ bool run_serialize_tests() {
     for (int i = 0; i < 100000; i++) { check(dist(gen)); }
 
     if (all_ok) {
-        std::print("ok    ipv4 serialization (scalar/SSE/IFMA == inet_ntop)\n");
+        std::print("ok    ipv4 serialization (scalar/SSE/IFMA/new == inet_ntop)\n");
     }
+    return all_ok;
+}
 
+bool run_ipv6_serialize_tests() {
+    bool all_ok = true;
     // IPv6 serialization: serialize_ipv6 must match inet_ntop byte-for-byte, and
     // parsing the output back must recover the original 16 bytes (round-trip).
     auto check6 = [&all_ok](const uint8_t bytes[16]) {
@@ -631,32 +708,127 @@ bool run_ipv4_tests() {
     return all_ok;
 }
 
-int main(int argc, char **argv) {
-    if (!run_tests() || !run_ipv4_tests() || !run_serialize_tests()) {
-        std::print("Tests failed; aborting benchmark.\n");
-        return 1;
-    }
-    std::print("\nIPv6 parse (random):\n");
-    collect_benchmark_results(1024, 100000);
-    std::print("\nIPv4 parse (random):\n");
-    collect_ipv4_benchmark_results(100000);
-    std::print("\nIPv4 serialize (random):\n");
-    collect_ipv4_serialize_benchmark(100000);
-    std::print("\nIPv6 serialize (random):\n");
-    collect_ipv6_serialize_benchmark(100000);
+// Named groups selectable on the command line. Each maps to a correctness test
+// (run under --tests) and a random-input benchmark (run under --bench).
+static const char* kGroups[] = {
+    "ipv6-parse", "ipv4-parse", "ipv4-serialize", "ipv6-serialize",
+};
 
-    // Optional: benchmark on a real-world address file (one per line), such as
-    // the TUM IPv6 Hitlist:
+static void print_usage(const char* prog) {
+    std::print("Usage: {} [options] [ipv6-address-file]\n\n", prog);
+    std::print("Options:\n");
+    std::print("  --only NAME[,NAME...]  Run only the named group(s); repeatable.\n");
+    std::print("                         Also accepts --only=NAME,NAME.\n");
+    std::print("  --no-tests             Skip correctness tests.\n");
+    std::print("  --no-bench             Skip benchmarks.\n");
+    std::print("  --data FILE            Real-world IPv6 address file to verify+benchmark.\n");
+    std::print("  --list                 List the available group names and exit.\n");
+    std::print("  -h, --help             Show this help and exit.\n\n");
+    std::print("Groups:");
+    for (const char* g : kGroups) { std::print(" {}", g); }
+    std::print("\n");
+    std::print("A bare (non-option) argument is treated as the IPv6 address file.\n");
+}
+
+// Splits "a,b,c" into the set, validating each name against kGroups.
+static bool add_names(const std::string& csv, std::set<std::string>& out) {
+    size_t start = 0;
+    while (start <= csv.size()) {
+        size_t comma = csv.find(',', start);
+        std::string name = csv.substr(start, comma - start);
+        if (!name.empty()) {
+            bool known = false;
+            for (const char* g : kGroups) { known |= (name == g); }
+            if (!known) {
+                std::print("unknown group '{}'\n", name);
+                return false;
+            }
+            out.insert(name);
+        }
+        if (comma == std::string::npos) { break; }
+        start = comma + 1;
+    }
+    return true;
+}
+
+int main(int argc, char **argv) {
+    std::set<std::string> only;   // empty => all groups
+    bool do_tests = true, do_bench = true;
+    std::string datafile;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        auto next = [&](const char* name) -> const char* {
+            if (i + 1 >= argc) {
+                std::print("{} requires an argument\n", name);
+                std::exit(1);
+            }
+            return argv[++i];
+        };
+        if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return 0; }
+        else if (arg == "--list") {
+            for (const char* g : kGroups) { std::print("{}\n", g); }
+            return 0;
+        }
+        else if (arg == "--no-tests") { do_tests = false; }
+        else if (arg == "--no-bench") { do_bench = false; }
+        else if (arg == "--data") { datafile = next("--data"); }
+        else if (arg.starts_with("--data=")) { datafile = arg.substr(7); }
+        else if (arg == "--only") { if (!add_names(next("--only"), only)) return 1; }
+        else if (arg.starts_with("--only=")) { if (!add_names(arg.substr(7), only)) return 1; }
+        else if (arg.starts_with("-")) {
+            std::print("unknown option '{}'\n", arg);
+            print_usage(argv[0]);
+            return 1;
+        }
+        else { datafile = arg; }  // bare argument: IPv6 address file
+    }
+
+    auto want = [&](const char* g) { return only.empty() || only.count(g); };
+
+    if (do_tests) {
+        bool ok = true;
+        if (want("ipv6-parse"))      { ok = run_tests() && ok; }
+        if (want("ipv4-parse"))      { ok = run_ipv4_tests() && ok; }
+        if (want("ipv4-serialize"))  { ok = run_ipv4_serialize_tests() && ok; }
+        if (want("ipv6-serialize"))  { ok = run_ipv6_serialize_tests() && ok; }
+        if (!ok) {
+            std::print("Tests failed; aborting benchmark.\n");
+            return 1;
+        }
+    }
+
+    if (do_bench) {
+        if (want("ipv6-parse")) {
+            std::print("\nIPv6 parse (random):\n");
+            collect_benchmark_results(1024, 100000);
+        }
+        if (want("ipv4-parse")) {
+            std::print("\nIPv4 parse (random):\n");
+            collect_ipv4_benchmark_results(100000);
+        }
+        if (want("ipv4-serialize")) {
+            std::print("\nIPv4 serialize (random):\n");
+            collect_ipv4_serialize_benchmark(100000);
+        }
+        if (want("ipv6-serialize")) {
+            std::print("\nIPv6 serialize (random):\n");
+            collect_ipv6_serialize_benchmark(100000);
+        }
+    }
+
+    // Optional: verify+benchmark on a real-world address file (one per line),
+    // such as the TUM IPv6 Hitlist:
     //   curl -O https://alcatraz.net.in.tum.de/ipv6-hitlist-service/open/responsive-addresses.txt.xz
     //   unxz responsive-addresses.txt.xz
     //   ./build/benchmark responsive-addresses.txt
-    if (argc > 1) {
-        std::vector<std::string> real = load_ipv6_addresses(argv[1]);
+    if (!datafile.empty() && want("ipv6-parse")) {
+        std::vector<std::string> real = load_ipv6_addresses(datafile);
         if (real.empty()) {
             return 1;
         }
-        std::print("\nIPv6 (real: {}, {} addresses):\n", argv[1], real.size());
+        std::print("\nIPv6 (real: {}, {} addresses):\n", datafile, real.size());
         verify_dataset(real);
-        benchmark_ipv6(real);
+        if (do_bench) { benchmark_ipv6(real); }
     }
 }
