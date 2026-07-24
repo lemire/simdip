@@ -543,7 +543,7 @@ bool run_ipv4_tests() {
         struct in_addr ref{};
         uint32_t got = 0, got_ada = 0, got_mula = 0, got_sz = 0;
         int ref_ok = inet_pton(AF_INET, s.c_str(), &ref);
-        int got_ok = parse_ipv4_avx512vl(s.data(), s.size(), &got);
+        int got_ok = parse_ipv4_avx512vl(s.data(), s.size(), &got);  // masked load: safe
         int ada_ok = parse_ipv4_ada(s.data(), s.size(), &got_ada);
         // Mula and simdzone read 16 bytes; give them a padded buffer so the
         // over-read stays in-bounds during the test.

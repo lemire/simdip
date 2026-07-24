@@ -11,16 +11,114 @@
 #include "ada_ip.h"
 
 /**
- * AVX-512VL and AVX-512BW based parsing of IPv4 and IPv6 addresses respectively.
- * credit to Shreesh Adiga.
+ * AVX-512 based parsing of IPv4 addresses in dotted-decimal form.
  *
- * Daniel Lemire, "Parsing IP addresses crazily fast," in Daniel Lemire's blog,
- * June 8, 2023, https://lemire.me/blog/2023/06/08/parsing-ip-addresses-crazily-fast/.
+ * This borrows the key trick from simdzone's branchless SSE parser
+ * (simdzone_ipv4.h): instead of computing the digit placement dynamically (a
+ * long dependency chain of compress / cvt / permutevar / movepi8 / compress /
+ * expand), it recognises that the layout of an IPv4 address is fully determined
+ * by the four octet lengths (each 1..3), giving only 81 possibilities. A perfect
+ * hash of the delimiter bit-pattern selects a precomputed 16-byte shuffle that
+ * positions the digits directly.
+ *
+ * Where it differs from (and improves on) simdzone:
+ *  - Because the caller passes `len`, it skips simdzone's length-inference
+ *    (saturate + clip_mask + popcnt): the delimiter partition that drives the
+ *    hash is just `dots | (1 << len)`.
+ *  - It arranges the shuffle so each octet lands as four little-endian bytes
+ *    [0, hundreds, tens, ones], then uses a single `_mm_dpbusd_epi32` (VNNI) to
+ *    multiply by {0,100,10,1} and horizontally sum into four 32-bit octet
+ *    values -- replacing simdzone's maddubs + shuffle + adds + packus.
+ *  - Validation (dot count/positions/length, all-digits, no leading zero, no
+ *    overflow) is done with AVX-512 mask compares, and the two mask-domain
+ *    checks are fused so the result crosses to a general register only once.
+ *
+ * Unlike simdzone (and Mula's SSE parser), which unconditionally read 16 bytes,
+ * this uses an AVX-512 masked load and reads exactly `len` bytes -- no over-read
+ * past the string, so it is safe on inputs that end near an unmapped page.
+ *
  */
 
+namespace avx512vl_ipv4 {
+
+// Perfect-hash multiplier borrowed from simdzone: for the 81 valid delimiter
+// bit-patterns, (partition * kHashMul) >> 24 yields 81 distinct keys in [0,256).
+static constexpr uint32_t kHashMul = 0x00CF7800u;
+
+struct Tables {
+    // Both tables are indexed directly by the 8-bit hash key. Because the hash
+    // is a perfect hash over the 81 valid layouts, each valid layout owns a
+    // distinct key, so no id-compaction indirection (and no second dependent
+    // load) is needed. Keys that no valid layout maps to hold a zeroed slot.
+
+    // per-key 16-byte shuffle: octet i occupies bytes [4i..4i+3] as
+    // [0x80 (->0), hundreds, tens, ones]; 0x80 lanes shuffle to zero.
+    uint8_t pat[256][16];
+    // per-key validation word, fetched in a single load: the low 16 bits are the
+    // canonical delimiter partition (three dots + terminator); the high 16 bits
+    // are a mask of the leading digit lane of each multi-digit octet.
+    //
+    //  - partition compare: the hash is only collision-free over the 81 valid
+    //    layouts, so an invalid layout (e.g. a 4-digit octet) may hash onto a
+    //    key a valid layout also uses. Comparing the actual partition against
+    //    this pinned value rejects every impostor and, in one compare, also
+    //    validates the dot count, dot positions, and length. An unused key holds
+    //    0, which no real (always non-zero) partition matches.
+    //  - leading lane mask: used to reject leading zeros (e.g. "01").
+    uint32_t aux[256];
+};
+
+// Builds both tables at compile time. Enumerates the 81 octet-length
+// combinations; a `throw` (which makes the function non-constant, i.e. a compile
+// error) fires if the perfect hash ever collides.
+constexpr Tables make_tables() {
+    Tables t{};
+    for (int k = 0; k < 256; k++) {
+        for (int b = 0; b < 16; b++) { t.pat[k][b] = 0x80; }
+    }
+    for (int l0 = 1; l0 <= 3; l0++)
+    for (int l1 = 1; l1 <= 3; l1++)
+    for (int l2 = 1; l2 <= 3; l2++)
+    for (int l3 = 1; l3 <= 3; l3++) {
+        const int s0 = 0;
+        const int s1 = l0 + 1;
+        const int s2 = l0 + l1 + 2;
+        const int s3 = l0 + l1 + l2 + 3;
+        const int len = s3 + l3;
+        // Delimiter positions: the three dots plus a virtual terminator at `len`.
+        const uint32_t partition = (1u << (uint32_t)l0) |
+                                   (1u << (uint32_t)(l0 + l1 + 1)) |
+                                   (1u << (uint32_t)(l0 + l1 + l2 + 2)) |
+                                   (1u << (uint32_t)len);
+        const uint32_t hk = (uint32_t)(partition * kHashMul) >> 24;
+        if (t.aux[hk] != 0) { throw "avx512vl_ipv4: perfect-hash collision"; }
+
+        const int starts[4] = {s0, s1, s2, s3};
+        const int lens[4] = {l0, l1, l2, l3};
+        uint16_t lead = 0;
+        for (int oc = 0; oc < 4; oc++) {
+            const int base = 4 * oc;
+            const int s = starts[oc];
+            const int l = lens[oc];
+            t.pat[hk][base + 3] = (uint8_t)(s + l - 1);              // ones
+            if (l >= 2) { t.pat[hk][base + 2] = (uint8_t)(s + l - 2); }  // tens
+            if (l == 3) { t.pat[hk][base + 1] = (uint8_t)(s); }         // hundreds
+            if (l == 3) { lead |= (uint16_t)(1u << (uint32_t)(base + 1)); }
+            else if (l == 2) { lead |= (uint16_t)(1u << (uint32_t)(base + 2)); }
+        }
+        t.aux[hk] = (uint32_t)partition | ((uint32_t)lead << 16);
+    }
+    return t;
+}
+
+static constexpr Tables T = make_tables();
+
+}  // namespace avx512vl_ipv4
+
 /**
- * Parses an IPv4 address in dotted-decimal form (e.g., "192.168.0.1")
- * using an AVX-512VL SIMD path.
+ * Parses an IPv4 address in dotted-decimal form (e.g., "192.168.0.1") using an
+ * AVX-512 SIMD path. Unusual-but-valid forms (octal, hex, leading zeros, fewer
+ * than four parts) fall back to the ada parser.
  *
  * @param input Pointer to the input string (NUL termination is not required).
  * @param len Length of the input string.
@@ -28,68 +126,78 @@
  * @return 1 on success, 0 if the format is invalid.
  */
 static int parse_ipv4_avx512vl(const char *input, size_t len, uint32_t *ptr) {
-    // Unusual-but-valid forms (octal/hex segments, fewer than four parts) are
-    // too long for, or rejected by, the SIMD path; defer them to the fallback.
+    // Reject len > 15 (a strict dotted-quad is at most "255.255.255.255"). This
+    // upper bound is correctness-critical: for len >= 16 the terminator bit
+    // (1<<len) leaves the 16-bit partition window -- and for len >= 32 _bzhi_u32
+    // saturates so it wraps to 0 and can alias a canonical partition, which would
+    // false-accept a long string. We only need the upper bound: for len < 7 the
+    // terminator sits below bit 7, beneath every canonical's high bit, so the
+    // fast path always declines and defers correctly (just one wasted pass).
     if (len > 15) [[unlikely]] { return parse_ipv4_ada(input, len, ptr); }
-    int error = 0;
-    __mmask16 len_mask = (1 << len) - 1;
-    __m128i dot = _mm_set1_epi8('.');
-    __m128i str = _mm_mask_loadu_epi8(dot, len_mask, (const __m128i *)input);
-    __mmask16 dots_bitvector = _mm_cmpeq_epu8_mask(str, dot);
-    __m128i digits_vec = _mm_sub_epi8(str, _mm_set1_epi8('0'));
-    // string should have only 3 dots
-    error |= (_mm_popcnt_u32(dots_bitvector & len_mask) != 3);
-    __mmask16 copy_mask = ~dots_bitvector;
-    __m128i index_reg = _mm_setr_epi8(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
-    // obtain the indices corresponding to location of the dots
-    __m128i compressed_index = _mm_maskz_compress_epi8(dots_bitvector, index_reg);
-    // 4 32-bit integers (zero-extended) a0, a1, a2, a3 where a_i indicates the location (1-16) of the i_th dot in input string
-    __m128i dot_location_epi32 = _mm_cvtepu8_epi32(compressed_index);
-    // 4 32-bit integers 0, a0, a1, a2
-    __m128i dot_location_shifted = _mm_bslli_si128(dot_location_epi32, 4);
-    // compute a0 - 0, a1 - a0, a2 - a1, a3 - a2 which gives number of digits between dots (including dot)
-    __m128i difference = _mm_sub_epi32(dot_location_epi32, dot_location_shifted);
-    // need to subtract 1 to exclude dot and get in-between digits count
-    __m128i num_digits_between_dots = _mm_sub_epi32(difference, _mm_set1_epi32(1));
-    // error if num_digits is not between 1 and 3
-    // using unsigned ((x - 1) > 2) for error expression instead of two compares
-    error |= _mm_cmpgt_epu8_mask(_mm_sub_epi32(num_digits_between_dots, _mm_set1_epi32(0x1)), _mm_set1_epi32(0x2));
-    __m128i expand_mask_creation_register = _mm_setr_epi8(
-            0,    0,    0,    0,
-            0,    0,    0, 0xff,
-            0,    0, 0xff, 0xff,
-            0, 0xff, 0xff, 0xff
-    );
 
-    // _mm_permutevar_ps is required to index into the expand_mask_creation_register
-    // _mm_movepi8_mask for each 32 bit integer will have the bitmask for zero padding necessary per octet.
-    __mmask16 expand_mask = _mm_movepi8_mask(
-            _mm_castps_si128(_mm_permutevar_ps(_mm_castsi128_ps(expand_mask_creation_register), num_digits_between_dots)));
+    // len_mask = (1<<len)-1 in a single BZHI (zero all bits from position len up),
+    // shaving the shift+decrement off the head of the critical path.
+    const uint32_t len_mask = _bzhi_u32(0xFFFFFFFFu, (unsigned)len);
+    const __m128i zero_digit = _mm_set1_epi8('0');
+    // Masked load: bytes [0,len) come from input, the rest are filled with '0'.
+    // Reads exactly `len` bytes -- no over-read past the string. Filling with a
+    // digit (rather than '.') means the padding lanes are neither dots nor
+    // non-digits, so `dots` below needs no masking and the digit check stays clean.
+    const __m128i str = _mm_mask_loadu_epi8(zero_digit, (__mmask16)len_mask, (const __m128i *)input);
 
-    // get rid of '.' and compress digits
-    __m128i compressed_vec = _mm_maskz_compress_epi8(copy_mask, digits_vec);
-    // all entries must be less than 10
-    error |= _mm_cmpgt_epu8_mask(compressed_vec, _mm_set1_epi8(0x9));
-    // expand the compressed_vec to have all octets with 4 digits (zero padding)
-    __m128i padded_digits_vec = _mm_maskz_expand_epi8(expand_mask, compressed_vec);
+    const __mmask16 dots = _mm_cmpeq_epi8_mask(str, _mm_set1_epi8('.'));  // the real dots
 
-    // Error if the leading digit is 0 e.g. 02, 012 etc will be treated as error.
-    // Extract the most significant digit from num_digits_between_dots and check if it is 0.
-    // If there is only 1 digit then skip the check as zero is valid number
-    __m128i shifted_vec = _mm_shuffle_epi8(padded_digits_vec,
-            _mm_sub_epi32(
-                _mm_setr_epi8(4, 0x0, 0x0, 0x0, 8, 0x0, 0x0, 0x0, 12, 0x0, 0x0, 0x0, 16, 0x0, 0x0, 0x0),
-                num_digits_between_dots));
-    __mmask8 more_than_1digit = _mm_cmpgt_epu32_mask(_mm_sub_epi32(num_digits_between_dots, _mm_set1_epi32(0x1)), _mm_setzero_si128());
-    error |= _mm_mask_cmpeq_epu32_mask(more_than_1digit, _mm_setzero_si128(), shifted_vec);
-    // multiply digits by 100, 10, 1 respectively and sum them to a 32 bit num
-    __m128i res = _mm_dpbusd_epi32(_mm_setzero_si128(), padded_digits_vec, _mm_set1_epi32(0x010a6400));
-    // error if any of the 4 octet is bigger than 255
-    error |= _mm_cmpgt_epu32_mask(res, _mm_set1_epi32(0xff));
+    // Delimiter pattern = the dots + a terminator bit at position `len`, then the
+    // same perfect hash simdzone uses. (1u<<len) == len_mask + 1. Indexing the
+    // tables by the 8-bit hash key directly (rather than a compacted id) keeps
+    // the critical path to a single dependent table load.
+    const uint32_t partition = (uint32_t)dots | (len_mask + 1u);
+    const uint32_t hash_key = (uint32_t)(partition * avx512vl_ipv4::kHashMul) >> 24;
+    const uint32_t aux = avx512vl_ipv4::T.aux[hash_key];  // low: partition, high: lead
+
+    // The partition must be exactly the canonical one for this key. This rejects
+    // any layout that is not four octets of 1..3 digits (wrong dot count/spacing,
+    // 4-digit octets, empty octets, wrong length) in a single compare.
+    int error = (partition != (aux & 0xFFFFu));
+
+    // Digit values: '0'..'9' -> 0..9; every non-digit maps to a byte > 9. `hole`
+    // marks lanes that are neither a digit nor a dot -- i.e. junk in a digit slot
+    // (e.g. "1.2.3.:"); a valid address has none. It is `~dots & bad` (kandn):
+    // padding lanes are '0' (a digit, not in `bad`), and dots are excluded, so
+    // only stray non-digits survive. Kept in the mask domain to fuse below.
+    const __m128i digits = _mm_sub_epi8(str, zero_digit);
+    const __mmask16 bad = _mm_cmpgt_epu8_mask(digits, _mm_set1_epi8(9));
+    const __mmask16 hole = _kandn_mask16(dots, bad);
+
+    // Position the digits: each octet -> [0, hundreds, tens, ones] little-endian.
+    const __m128i shuf = _mm_loadu_si128((const __m128i *)avx512vl_ipv4::T.pat[hash_key]);
+    const __m128i padded = _mm_shuffle_epi8(digits, shuf);
+
+    // One VNNI dot-product does hundreds*100 + tens*10 + ones*1 per octet, each
+    // landing in its own 32-bit lane. Weight bytes (LE): 0, 100, 10, 1.
+    const __m128i res = _mm_dpbusd_epi32(_mm_setzero_si128(), padded,
+                                         _mm_set1_epi32(0x010a6400));
+    const __mmask8 over = _mm_cmpgt_epu32_mask(res, _mm_set1_epi32(0xff));  // octet > 255
+
+    // Fuse the two mask-domain checks (junk lanes + octet overflow) into one
+    // k-register and cross to the GPR error accumulator exactly once. `over` is
+    // the tail of the dpbusd critical chain, so folding it in with a 1-cycle
+    // kor + kortest beats sinking it through a 3-cycle k->GPR move on its own.
+    error |= (_kor_mask16(hole, (__mmask16)over) != 0);
+
+    // Leading-zero check: `lead` (aux >> 16) marks only the most-significant
+    // lane of each multi-digit octet, and those lanes always hold a real digit
+    // (never padding), so a zero there is exactly a leading zero like "01".
+    const __m128i zero_lane = _mm_cmpeq_epi8(_mm_setzero_si128(), padded);
+    const uint32_t lz = (uint32_t)_mm_movemask_epi8(zero_lane);
+    error |= ((lz & (aux >> 16)) != 0);
 
     if (!error) [[likely]] {
-        // assemble the bytes and convert from network order to host order and write to memory
-        _mm_storeu_si32(ptr, _mm_shuffle_epi8(res, _mm_setr_epi8(0, 4, 8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
+        // Gather the low byte of each 32-bit octet into bytes 0..3 (network
+        // order) and store.
+        _mm_storeu_si32(ptr, _mm_shuffle_epi8(res, _mm_setr_epi8(0, 4, 8, 12, 0, 0,
+                                                                 0, 0, 0, 0, 0, 0,
+                                                                 0, 0, 0, 0)));
         return 1;
     }
 
