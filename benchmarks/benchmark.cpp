@@ -16,6 +16,7 @@
 #include "ada_ip.h"
 #include "vtlmks_ipv6.h"
 #include "mula_sse_ipv4.h"
+#include "simdzone_ipv4.h"
 
 // Competitor libraries fetched via CPM (see CMakeLists.txt).
 #include "ipv6.h"                       // jrepp/ipv6-parse (pure C)
@@ -375,6 +376,17 @@ void collect_ipv4_benchmark_results(size_t number_strings) {
     counter = c;
   };
   pretty_print("Mula (SSE)", number_strings, counters::bench(count_mula));
+  auto count_simdzone = [&strings, &counter]() {
+    size_t c = 0;
+    for (const auto& ip_str : strings) {
+        uint32_t addr = 0;
+        if (parse_ipv4_simdzone(ip_str.data(), ip_str.size(), &addr)) {
+            c += ((const uint8_t*)&addr)[0];
+        }
+    }
+    counter = c;
+  };
+  pretty_print("simdzone (SSE)", number_strings, counters::bench(count_simdzone));
   auto count_aton = [&strings, &counter]() {
     size_t c = 0;
     for (const auto& ip_str : strings) {
@@ -529,17 +541,25 @@ bool run_ipv4_tests() {
 
     for (const auto& s : standard) {
         struct in_addr ref{};
-        uint32_t got = 0, got_ada = 0;
+        uint32_t got = 0, got_ada = 0, got_mula = 0, got_sz = 0;
         int ref_ok = inet_pton(AF_INET, s.c_str(), &ref);
         int got_ok = parse_ipv4_avx512vl(s.data(), s.size(), &got);
         int ada_ok = parse_ipv4_ada(s.data(), s.size(), &got_ada);
-        if (ref_ok != 1 || got_ok != 1 || ada_ok != 1) {
+        // Mula and simdzone read 16 bytes; give them a padded buffer so the
+        // over-read stays in-bounds during the test.
+        char buf[16] = {0};
+        std::memcpy(buf, s.data(), s.size());
+        int mula_ok = parse_ipv4_mula_sse(buf, s.size(), &got_mula);
+        int sz_ok = parse_ipv4_simdzone(buf, s.size(), &got_sz);
+        if (ref_ok != 1 || got_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1) {
             std::print("FAIL  ipv4 (standard) rejected {}\n", s);
             all_ok = false;
             continue;
         }
         if (std::memcmp(&ref.s_addr, &got, 4) != 0 ||
-            std::memcmp(&ref.s_addr, &got_ada, 4) != 0) {
+            std::memcmp(&ref.s_addr, &got_ada, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_mula, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_sz, 4) != 0) {
             std::print("FAIL  ipv4 (standard) mismatch on {}\n", s);
             all_ok = false;
             continue;
