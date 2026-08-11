@@ -595,9 +595,68 @@ bool run_ipv4_tests() {
         }
     }
 
+    // Malformed pure-decimal hosts that still look like "digits and three dots"
+    // (the shape a naive AVX-512 pre-check might accept) but violate group
+    // structure: each group must be 1-3 digits and non-empty. From
+    // https://github.com/ada-url/ada/pull/1212 — must be rejected on every path.
+    const std::vector<std::string> malformed_groups = {
+        "1234.5.6.7",   // group longer than three digits
+        "1.2345.6.7",   // group longer than three digits
+        "1..2.34",      // empty group / consecutive dots
+        "12.3..4",      // empty group / consecutive dots
+    };
+    for (const auto& s : malformed_groups) {
+        uint32_t got = 0, got_ada = 0, got_mula = 0, got_sz = 0;
+        int got_ok = parse_ipv4_avx512vl(s.data(), s.size(), &got);
+        int ada_ok = parse_ipv4_ada(s.data(), s.size(), &got_ada);
+        char buf[16] = {0};
+        std::memcpy(buf, s.data(), s.size());
+        int mula_ok = parse_ipv4_mula_sse(buf, s.size(), &got_mula);
+        int sz_ok = parse_ipv4_simdzone(buf, s.size(), &got_sz);
+        if (got_ok != 0) {
+            std::print("FAIL  AVX-512 accepted malformed {}\n", s);
+            all_ok = false;
+        }
+        if (ada_ok != 0) {
+            std::print("FAIL  ada accepted malformed {}\n", s);
+            all_ok = false;
+        }
+        if (mula_ok != 0) {
+            std::print("FAIL  mula accepted malformed {}\n", s);
+            all_ok = false;
+        }
+        if (sz_ok != 0) {
+            std::print("FAIL  simdzone accepted malformed {}\n", s);
+            all_ok = false;
+        }
+    }
+
+    // Same length as "1234.5.6.7" / "1.2345.6.7", but well-formed — must parse.
+    {
+        const std::string ok_host = "12.34.56.78";
+        struct in_addr ref{};
+        uint32_t got = 0, got_ada = 0, got_mula = 0, got_sz = 0;
+        int ref_ok = inet_pton(AF_INET, ok_host.c_str(), &ref);
+        int got_ok = parse_ipv4_avx512vl(ok_host.data(), ok_host.size(), &got);
+        int ada_ok = parse_ipv4_ada(ok_host.data(), ok_host.size(), &got_ada);
+        char buf[16] = {0};
+        std::memcpy(buf, ok_host.data(), ok_host.size());
+        int mula_ok = parse_ipv4_mula_sse(buf, ok_host.size(), &got_mula);
+        int sz_ok = parse_ipv4_simdzone(buf, ok_host.size(), &got_sz);
+        if (ref_ok != 1 || got_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1 ||
+            std::memcmp(&ref.s_addr, &got, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_ada, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_mula, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_sz, 4) != 0) {
+            std::print("FAIL  ipv4 well-formed same-length host {}\n", ok_host);
+            all_ok = false;
+        }
+    }
+
     if (all_ok) {
-        std::print("ok    ipv4 parse ({} standard, {} unusual/fallback)\n",
-                   standard.size(), unusual.size());
+        std::print("ok    ipv4 parse ({} standard, {} unusual/fallback, "
+                   "{} malformed-reject, 1 same-length ok)\n",
+                   standard.size(), unusual.size(), malformed_groups.size());
     }
     return all_ok;
 }
