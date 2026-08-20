@@ -14,12 +14,16 @@
  * AVX-512 based parsing of IPv4 addresses in dotted-decimal form.
  *
  * Digit placement is computed from the delimiter positions, with no shuffle
- * table. Compress of the constant [0..15] by the marker mask (three dots plus
- * a terminator at `len`) yields (q₀,q₁,q₂,q₃). Broadcasting each qᵢ, adding
- * [−4,−3,−2,−1], and signed-max with qᵢ₋₁ (and −1 in lane 0) builds a permute
- * index that points digit bytes at the right sources and pad bytes at a
- * pre-zeroed location (the previous dot, or the tail via index −1 ≡ 15). One
- * `vpermb` then expands each octet to [0, hundreds, tens, ones].
+ * table. The masked load fills the tail with '.', so the terminator at `len` is
+ * a real dot and the marker mask is just the dot compare -- it stays in a k
+ * register. Compress of the constant [0..15] by that mask yields (q₀,q₁,q₂,q₃),
+ * the three dots and the terminator. Broadcasting each qᵢ, adding [−4,−3,−2,−1],
+ * and signed-max with qᵢ₋₁ (and −1 in lane 0) builds a shuffle index that points
+ * digit bytes at the right sources and pad bytes either at the previous dot
+ * (zeroed in the digit vector) or, in octet 0, at a negative index. One
+ * `pshufb` then expands each octet to [0, hundreds, tens, ones]: a negative
+ * control byte zeroes its lane for free, which is exactly what octet 0's pads
+ * want, so this needs no AVX512-VBMI.
  *
  * `_mm_dpbusd_epi32` (VNNI) multiplies by {0,100,10,1} and horizontally sums
  * into four 32-bit octet values.
@@ -46,29 +50,34 @@
  */
 static int parse_ipv4_avx512vl(const char *input, size_t len, uint32_t *ptr) {
     // Reject len > 15 (a strict dotted-quad is at most "255.255.255.255"). The
-    // terminator bit lives in a 16-bit mask (1<<len); beyond that the compress
-    // would not see it. We only need the upper bound: shorter invalid strings
+    // terminator is the first byte of the '.'-filled tail, which only exists
+    // while len < 16. We only need the upper bound: shorter invalid strings
     // fail the layout checks and fall through to ada.
     if (len > 15) [[unlikely]] { return parse_ipv4_ada(input, len, ptr); }
 
     const uint32_t len_mask = _bzhi_u32(0xFFFFFFFFu, (unsigned)len);
-    // Masked load: bytes [0,len) come from input, the rest are zero. Reads
-    // exactly `len` bytes -- no over-read past the string.
-    const __m128i v = _mm_maskz_loadu_epi8((__mmask16)len_mask, (const __m128i *)input);
+    // Masked load: bytes [0,len) come from input, the rest are filled with '.'.
+    // Reads exactly `len` bytes -- no over-read past the string. Filling with a
+    // dot makes the virtual terminator at `len` a real one, so the marker mask
+    // is just the dot compare: no or, and the compare stays in a k register
+    // instead of being rebuilt from a GPR partition.
+    const __m128i dot_v = _mm_set1_epi8('.');
+    const __m128i v = _mm_mask_loadu_epi8(dot_v, (__mmask16)len_mask, (const __m128i *)input);
 
-    const __mmask16 dots = _mm_cmpeq_epi8_mask(v, _mm_set1_epi8('.'));
-    const uint32_t keep = len_mask & ~(uint32_t)dots;  // digit lanes (in-range, not dots)
-    // Markers = the three dots plus a virtual terminator at `len`.
-    const __mmask16 delim = (__mmask16)((uint32_t)dots | (len_mask + 1u));
+    // Markers: the three dots plus the '.'-filled tail. Only the first four
+    // compressed positions are read, so the extra tail dots are harmless.
+    const __mmask16 delim = _mm_cmpeq_epi8_mask(v, dot_v);
+    const uint32_t dots = (uint32_t)delim & len_mask;   // the real dots
+    const uint32_t keep = len_mask & ~dots;             // digit lanes
 
     const __m128i zero_digit = _mm_set1_epi8('0');
-    // Digit values in [0,len); tail stays 0. Non-digits become a byte > 9.
-    const __m128i digits = _mm_maskz_sub_epi8((__mmask16)len_mask, v, zero_digit);
+    // Digit values; dots and the tail land above 9.
+    const __m128i digits = _mm_sub_epi8(v, zero_digit);
+    const __mmask16 is_digit = _mm_cmple_epu8_mask(digits, _mm_set1_epi8(9));
     // Junk in a digit slot (e.g. "1.2.3.:"): neither a digit nor a dot.
-    const __mmask16 hole = _kand_mask16(
-        _mm_cmpgt_epu8_mask(digits, _mm_set1_epi8(9)), (__mmask16)keep);
-    // Zero dots (and any holes): pad fetches of a previous-dot index return 0.
-    const __m128i v0 = _mm_maskz_mov_epi8((__mmask16)keep, digits);
+    const __mmask16 hole = _kandn_mask16(is_digit, (__mmask16)keep);
+    // Zero every non-digit lane: pad fetches of a previous-dot index return 0.
+    const __m128i v0 = _mm_maskz_mov_epi8(is_digit, digits);
 
     // c = vpcompressb(iota, D): bytes 0..3 are (q₀,q₁,q₂,q₃), the marker
     // positions. Compress does the rank scan that tzcnt/pdep would.
@@ -88,14 +97,15 @@ static int parse_ipv4_avx512vl(const char *input, size_t len, uint32_t *ptr) {
         _mm_shuffle_epi8(_mm_alignr_epi8(c, _mm_set1_epi8(-1), 15), k_rep);
     // Kill the pads without a mask: digits have idx ≥ qᵢ₋₁+1 and are
     // untouched; pads have idx ≤ qᵢ₋₁ and clamp onto the previous dot.
-    // Lane 0 pads clamp to −1 ≡ 15 (mod 16) = the zeroed tail byte.
+    // Octet 0's pads clamp to −1, whose bit 7 makes pshufb emit zero.
     const __m128i idx = _mm_max_epi8(
         _mm_add_epi8(qi, _mm_setr_epi8(-4, -3, -2, -1, -4, -3, -2, -1, -4, -3,
                                        -2, -1, -4, -3, -2, -1)),
         prev);
-    // One permute replaces both a compress of the digits and an expand into
-    // [0, hundreds, tens, ones] per octet.
-    const __m128i padded = _mm_permutexvar_epi8(idx, v0);
+    // pshufb, not permb: every index is either a real position in [0,15] or
+    // negative, and a negative control byte zeroes the lane for free. One cycle
+    // instead of three, and no AVX512-VBMI needed.
+    const __m128i padded = _mm_shuffle_epi8(v0, idx);
 
     // One VNNI dot-product does hundreds*100 + tens*10 + ones*1 per octet, each
     // landing in its own 32-bit lane. Weight bytes (LE): 0, 100, 10, 1.
@@ -118,9 +128,9 @@ static int parse_ipv4_avx512vl(const char *input, size_t len, uint32_t *ptr) {
     // Leading zero: a '0' at the start of an octet whose next char is a digit
     // (e.g. "01"). Bare "0" is fine -- the next char is a dot or the end.
     const uint32_t zero_bits = (uint32_t)_mm_cmpeq_epi8_mask(v, zero_digit);
-    const uint32_t start_bits = ((uint32_t)dots << 1) | 1u;
+    const uint32_t start_bits = (dots << 1) | 1u;
 
-    int error = (_mm_popcnt_u32((uint32_t)dots) != 3);
+    int error = (_mm_popcnt_u32(dots) != 3);
     error |= (bad_gap != 0);
     error |= (_kor_mask16(hole, (__mmask16)over) != 0);
     error |= ((zero_bits & start_bits & (keep >> 1)) != 0);
