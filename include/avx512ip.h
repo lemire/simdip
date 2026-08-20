@@ -395,6 +395,152 @@ static int parse_ipv4_avx512vl_notab2(const char *input, size_t len, uint32_t *p
     return parse_ipv4_ada(input, len, ptr);
 }
 
+/**
+ * Table-free AVX-512 IPv4 parse, third cut: _notab2's shape, but every check
+ * that does not need the VNNI result is computed in general registers from the
+ * dot bitmask, which is ready long before `c` is.
+ *
+ * The point is not that scalar ops are cheaper -- they are not, this needs more
+ * of them -- but that they leave the compress/shuffle chain alone and issue on
+ * ports the vector chain is not using. Both other variants put their layout
+ * check downstream of `vpcompressb`; here nothing but the octet values is.
+ */
+static int parse_ipv4_avx512vl_notab3(const char *input, size_t len, uint32_t *ptr) {
+    if (len > 15) [[unlikely]] { return parse_ipv4_ada(input, len, ptr); }
+
+    const uint32_t len_mask = _bzhi_u32(0xFFFFFFFFu, (unsigned)len);
+    const __m128i dot_v = _mm_set1_epi8('.');
+    const __m128i v = _mm_mask_loadu_epi8(dot_v, (__mmask16)len_mask, (const __m128i *)input);
+
+    // Everything below this line is ready ~6 cycles in, while the compress
+    // chain still has ~10 to run.
+    const __mmask16 delim = _mm_cmpeq_epi8_mask(v, dot_v);
+    const uint32_t dots = (uint32_t)delim & len_mask;
+    const uint32_t keep = len_mask & ~dots;
+
+    const __m128i zero_digit = _mm_set1_epi8('0');
+    const __m128i digits = _mm_sub_epi8(v, zero_digit);
+    const __mmask16 is_digit = _mm_cmple_epu8_mask(digits, _mm_set1_epi8(9));
+    const __m128i v0 = _mm_maskz_mov_epi8(is_digit, digits);
+
+    // --- critical path: compress -> index -> pshufb -> dpbusd ---------------
+    const __m128i iota =
+        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m128i c = _mm_maskz_compress_epi8(delim, iota);
+    const __m128i k_rep =
+        _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    const __m128i qi = _mm_shuffle_epi8(c, k_rep);
+    const __m128i prev =
+        _mm_shuffle_epi8(_mm_alignr_epi8(c, _mm_set1_epi8(-1), 15), k_rep);
+    const __m128i idx = _mm_max_epi8(
+        _mm_add_epi8(qi, _mm_setr_epi8(-4, -3, -2, -1, -4, -3, -2, -1, -4, -3,
+                                       -2, -1, -4, -3, -2, -1)),
+        prev);
+    const __m128i padded = _mm_shuffle_epi8(v0, idx);
+    const __m128i res = _mm_dpbusd_epi32(_mm_setzero_si128(), padded,
+                                         _mm_set1_epi32(0x010a6400));
+
+    // --- validation, scalar, entirely off the compress chain ---------------
+    // Layout: exactly three dots, none leading, adjacent or trailing, and no
+    // run of four digit lanes (a 4-digit octet). Together with len <= 15 that
+    // is exactly the 81 valid layouts.
+    uint32_t error = (uint32_t)(_mm_popcnt_u32(dots) ^ 3u);
+    error |= dots & 1u;
+    error |= dots & (dots << 1);
+    error |= dots & (len_mask ^ (len_mask >> 1));
+    error |= keep & (keep << 1) & (keep << 2) & (keep << 3);
+    // Junk in a digit slot: in range, not a dot, not a digit.
+    error |= keep & ~(uint32_t)is_digit;
+    // Leading zero: '0' starting an octet whose successor is a digit lane.
+    const uint32_t zero_bits = (uint32_t)_mm_cmpeq_epi8_mask(v, zero_digit);
+    error |= zero_bits & ((dots << 1) | 1u) & (keep >> 1);
+    // Octet > 255 is the only check that has to wait for the VNNI result.
+    error |= (uint32_t)_mm_cmpgt_epu32_mask(res, _mm_set1_epi32(0xff));
+
+    if (!error) [[likely]] {
+        _mm_storeu_si32(ptr, _mm_shuffle_epi8(res, _mm_setr_epi8(0, 4, 8, 12, 0, 0,
+                                                                 0, 0, 0, 0, 0, 0,
+                                                                 0, 0, 0, 0)));
+        return 1;
+    }
+    return parse_ipv4_ada(input, len, ptr);
+}
+
+namespace avx512vl_ipv4_k {
+// Held in .rodata rather than built with mov+vpbroadcastd. When the parser is
+// not inlined (as in the benchmark) GCC re-materialises every _mm_set1 through
+// a general register -- two instructions each, seven times -- whereas a
+// .rodata constant folds into the consuming instruction as a memory operand.
+static const __m128i dot   = _mm_setr_epi8('.','.','.','.','.','.','.','.','.','.','.','.','.','.','.','.');
+static const __m128i zero  = _mm_setr_epi8('0','0','0','0','0','0','0','0','0','0','0','0','0','0','0','0');
+static const __m128i nine  = _mm_setr_epi8(9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9);
+static const __m128i iota  = _mm_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+static const __m128i k_rep = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
+static const __m128i off   = _mm_setr_epi8(-4,-3,-2,-1,-4,-3,-2,-1,-4,-3,-2,-1,-4,-3,-2,-1);
+static const __m128i ones  = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+static const __m128i gmin  = _mm_setr_epi8(1,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0);
+// Lanes 4..15 hold 255, which an unsigned byte can never exceed, so the gap
+// compare needs no 0x000F write-mask (and no mov+kmovw to build it).
+static const __m128i gmax  = _mm_setr_epi8(2,2,2,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+static const __m128i wts   = _mm_setr_epi8(0,100,10,1,0,100,10,1,0,100,10,1,0,100,10,1);
+static const __m128i ff    = _mm_setr_epi8(-1,0,0,0,-1,0,0,0,-1,0,0,0,-1,0,0,0);
+static const __m128i pack  = _mm_setr_epi8(0,4,8,12,0,0,0,0,0,0,0,0,0,0,0,0);
+}  // namespace avx512vl_ipv4_k
+
+/**
+ * Table-free AVX-512 IPv4 parse, fourth cut: _notab's algorithm unchanged, with
+ * two codegen-level changes.
+ *
+ *  - Splat constants live in .rodata instead of being rebuilt through a general
+ *    register on every call.
+ *  - The gap compare uses a per-lane bound ({2,2,2,2,255,...}) instead of a
+ *    0x000F write-mask, so lanes 4..15 can never trip and the constant k-mask
+ *    (a mov plus a kmovw) disappears.
+ */
+static int parse_ipv4_avx512vl_notab4(const char *input, size_t len, uint32_t *ptr) {
+    namespace K = avx512vl_ipv4_k;
+    if (len > 15) [[unlikely]] { return parse_ipv4_ada(input, len, ptr); }
+
+    const uint32_t len_mask = _bzhi_u32(0xFFFFFFFFu, (unsigned)len);
+    const __m128i v = _mm_mask_loadu_epi8(K::dot, (__mmask16)len_mask, (const __m128i *)input);
+
+    const __mmask16 delim = _mm_cmpeq_epi8_mask(v, K::dot);
+    const uint32_t dots = (uint32_t)delim & len_mask;
+    const uint32_t keep = len_mask & ~dots;
+
+    const __m128i digits = _mm_sub_epi8(v, K::zero);
+    const __mmask16 is_digit = _mm_cmple_epu8_mask(digits, K::nine);
+    const __mmask16 hole = _kandn_mask16(is_digit, (__mmask16)keep);
+    const __m128i v0 = _mm_maskz_mov_epi8(is_digit, digits);
+
+    const __m128i c = _mm_maskz_compress_epi8(delim, K::iota);
+    const __m128i qi = _mm_shuffle_epi8(c, K::k_rep);
+    const __m128i prev = _mm_shuffle_epi8(_mm_alignr_epi8(c, K::ones, 15), K::k_rep);
+    const __m128i idx = _mm_max_epi8(_mm_add_epi8(qi, K::off), prev);
+    const __m128i padded = _mm_shuffle_epi8(v0, idx);
+
+    const __m128i res = _mm_dpbusd_epi32(_mm_setzero_si128(), padded, K::wts);
+    const __mmask8 over = _mm_cmpgt_epu32_mask(res, K::ff);
+
+    // Octet lengths from marker gaps, with the lane restriction folded into the
+    // bound rather than into a write-mask.
+    const __m128i gap = _mm_sub_epi8(c, _mm_slli_si128(c, 1));
+    const __mmask16 bad_gap =
+        _mm_cmpgt_epu8_mask(_mm_sub_epi8(gap, K::gmin), K::gmax);
+
+    const uint32_t zero_bits = (uint32_t)_mm_cmpeq_epi8_mask(v, K::zero);
+    const uint32_t start_bits = (dots << 1) | 1u;
+
+    int error = (_mm_popcnt_u32(dots) != 3);
+    error |= (bad_gap != 0);
+    error |= (_kor_mask16(hole, (__mmask16)over) != 0);
+    error |= ((zero_bits & start_bits & (keep >> 1)) != 0);
+
+    if (!error) [[likely]] {
+        _mm_storeu_si32(ptr, _mm_shuffle_epi8(res, K::pack));
+        return 1;
+    }
+    return parse_ipv4_ada(input, len, ptr);
+}
+
 #endif
-
-
