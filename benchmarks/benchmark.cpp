@@ -631,6 +631,63 @@ bool run_ipv4_tests() {
         }
     }
 
+    // Every 1..3-digit layout of a strict dotted-quad (81 combinations). The
+    // permute is driven by octet lengths, so this is the completeness check
+    // for the table-free path. Values 1 / 12 / 123, no leading zeros.
+    {
+        const int kVal[4] = {0, 1, 12, 123};
+        for (int l0 = 1; l0 <= 3; l0++)
+        for (int l1 = 1; l1 <= 3; l1++)
+        for (int l2 = 1; l2 <= 3; l2++)
+        for (int l3 = 1; l3 <= 3; l3++) {
+            char s[16];
+            char *p = s;
+            auto app = [&](int l) {
+                int v = kVal[l];
+                if (v >= 100) { *p++ = char('0' + v / 100); }
+                if (v >= 10)  { *p++ = char('0' + (v / 10) % 10); }
+                *p++ = char('0' + v % 10);
+            };
+            app(l0); *p++ = '.'; app(l1); *p++ = '.'; app(l2); *p++ = '.'; app(l3);
+            const size_t slen = size_t(p - s);
+            uint8_t want[4] = {uint8_t(kVal[l0]), uint8_t(kVal[l1]),
+                               uint8_t(kVal[l2]), uint8_t(kVal[l3])};
+            struct in_addr ref{};
+            uint32_t got = 0, got_ada = 0, got_mula = 0, got_sz = 0;
+            int ref_ok = inet_pton(AF_INET, std::string(s, slen).c_str(), &ref);
+            int got_ok = parse_ipv4_avx512vl(s, slen, &got);
+            int ada_ok = parse_ipv4_ada(s, slen, &got_ada);
+            char buf[16] = {0};
+            std::memcpy(buf, s, slen);
+            int mula_ok = parse_ipv4_mula_sse(buf, slen, &got_mula);
+            int sz_ok = parse_ipv4_simdzone(buf, slen, &got_sz);
+            if (ref_ok != 1 || got_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1 ||
+                std::memcmp(&ref.s_addr, want, 4) != 0 ||
+                std::memcmp(&got, want, 4) != 0 ||
+                std::memcmp(&got_ada, want, 4) != 0 ||
+                std::memcmp(&got_mula, want, 4) != 0 ||
+                std::memcmp(&got_sz, want, 4) != 0) {
+                std::print("FAIL  ipv4 layout {} ({}-{}-{}-{})\n",
+                           std::string_view(s, slen), l0, l1, l2, l3);
+                all_ok = false;
+            }
+        }
+    }
+
+    // Overflow: four well-spaced digit groups, but an octet > 255.
+    for (const char *s : {"256.1.1.1", "1.256.1.1", "1.1.256.1", "1.1.1.256",
+                          "999.0.0.1", "1.2.3.999"}) {
+        uint32_t got = 0, got_ada = 0;
+        if (parse_ipv4_avx512vl(s, std::strlen(s), &got) != 0) {
+            std::print("FAIL  AVX-512 accepted overflow {}\n", s);
+            all_ok = false;
+        }
+        if (parse_ipv4_ada(s, std::strlen(s), &got_ada) != 0) {
+            std::print("FAIL  ada accepted overflow {}\n", s);
+            all_ok = false;
+        }
+    }
+
     // Same length as "1234.5.6.7" / "1.2345.6.7", but well-formed — must parse.
     {
         const std::string ok_host = "12.34.56.78";
@@ -655,7 +712,8 @@ bool run_ipv4_tests() {
 
     if (all_ok) {
         std::print("ok    ipv4 parse ({} standard, {} unusual/fallback, "
-                   "{} malformed-reject, 1 same-length ok)\n",
+                   "{} malformed-reject, 81 layouts, 6 overflow-reject, "
+                   "1 same-length ok)\n",
                    standard.size(), unusual.size(), malformed_groups.size());
     }
     return all_ok;
