@@ -320,5 +320,81 @@ static int parse_ipv4_avx512vl_notab(const char *input, size_t len, uint32_t *pt
     return parse_ipv4_ada(input, len, ptr);
 }
 
+/**
+ * Table-free AVX-512 IPv4 parse, second cut. Same contract as
+ * parse_ipv4_avx512vl_notab, but keeps validation in k-registers: q₃==len
+ * instead of popcnt, junk/leading-zero/overflow fused with kor, one kortest
+ * at the end.
+ */
+static int parse_ipv4_avx512vl_notab2(const char *input, size_t len, uint32_t *ptr) {
+    if (len > 15) [[unlikely]] { return parse_ipv4_ada(input, len, ptr); }
+
+    const __mmask16 len_k = (__mmask16)_bzhi_u32(0xFFFFFFFFu, (unsigned)len);
+    const __m128i dot_v = _mm_set1_epi8('.');
+    const __m128i v = _mm_mask_loadu_epi8(dot_v, len_k, (const __m128i *)input);
+
+    const __mmask16 delim = _mm_cmpeq_epi8_mask(v, dot_v);
+
+    const __m128i zero_digit = _mm_set1_epi8('0');
+    const __m128i digits = _mm_sub_epi8(v, zero_digit);
+    const __mmask16 is_digit = _mm_cmple_epu8_mask(digits, _mm_set1_epi8(9));
+    const __m128i v0 = _mm_maskz_mov_epi8(is_digit, digits);
+
+    const __m128i iota =
+        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m128i c = _mm_maskz_compress_epi8(delim, iota);
+
+    const __m128i k_rep =
+        _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    const __m128i qi = _mm_shuffle_epi8(c, k_rep);
+    const __m128i prev =
+        _mm_shuffle_epi8(_mm_alignr_epi8(c, _mm_set1_epi8(-1), 15), k_rep);
+    const __m128i idx = _mm_max_epi8(
+        _mm_add_epi8(qi, _mm_setr_epi8(-4, -3, -2, -1, -4, -3, -2, -1, -4, -3,
+                                       -2, -1, -4, -3, -2, -1)),
+        prev);
+    const __m128i padded = _mm_shuffle_epi8(v0, idx);
+    const __m128i res = _mm_dpbusd_epi32(_mm_setzero_si128(), padded,
+                                         _mm_set1_epi32(0x010a6400));
+
+    const __m128i gap = _mm_sub_epi8(c, _mm_slli_si128(c, 1));
+    const __mmask16 bad_gap = _mm_mask_cmpgt_epu8_mask(
+        0x000F,
+        _mm_sub_epi8(gap, _mm_setr_epi8(1, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0)),
+        _mm_set1_epi8(2));
+
+    // Exactly three dots: the rank-3 marker must be the terminator at `len`.
+    // With fewer real dots, lane 3 holds a tail dot past len (or compress's
+    // zero fill); with more, a real dot before len. The broadcast of `len`
+    // issues at entry, well before `c` is ready.
+    __mmask16 err =
+        _mm_mask_cmpneq_epi8_mask(0x8, c, _mm_set1_epi8((char)len));
+    err = _kor_mask16(err, bad_gap);
+    // Junk in a digit slot: inside [0,len) yet neither digit nor dot.
+    err = _kor_mask16(err, _kandn_mask16(_kor_mask16(delim, is_digit), len_k));
+    // Leading zero: '0' at an octet start whose successor is a digit lane.
+    // delim<<1 needs no len masking: shifted tail bits land where v is '.'.
+    const __mmask16 zero_k = _mm_cmpeq_epi8_mask(v, zero_digit);
+    const __mmask16 starts =
+        _kor_mask16(_kshiftli_mask16(delim, 1), _cvtu32_mask16(1));
+    err = _kor_mask16(
+        err, _kand_mask16(zero_k,
+                          _kand_mask16(starts, _kshiftri_mask16(is_digit, 1))));
+    // Octet > 255 joins last: it waits on the VNNI result anyway.
+    err = _kor_mask16(err, (__mmask16)_mm_cmpgt_epu32_mask(
+                               res, _mm_set1_epi32(0xff)));
+
+    if (_kortestz_mask16_u8(err, err)) [[likely]] {
+        _mm_storeu_si32(ptr, _mm_shuffle_epi8(res, _mm_setr_epi8(0, 4, 8, 12, 0,
+                                                                 0, 0, 0, 0, 0,
+                                                                 0, 0, 0, 0, 0,
+                                                                 0)));
+        return 1;
+    }
+    return parse_ipv4_ada(input, len, ptr);
+}
+
 #endif
+
 
