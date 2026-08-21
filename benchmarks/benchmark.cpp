@@ -243,6 +243,124 @@ void benchmark_ipv6(const std::vector<std::string>& strings) {
   pretty_print("Boost.Asio", number_strings, counters::bench(count_boost));
 }
 
+// Builds a corpus whose *textual shapes* match real-world IPv6, which is what a
+// parser actually sees. inet_ntop of uniform random bytes -- what
+// generate_random_ipv6_addresses does -- produces eight four-digit hextets and
+// essentially never a "::" or an embedded IPv4 literal, so it exercises only
+// the cheapest path a SIMD parser has. Measured on this machine, that one path
+// is 20 cycles/address while the "::" path is 40 and an IPv4-mapped address
+// costs 203, so the random corpus hides a 10x spread.
+//
+// Rather than assert ownership of specific allocations, the table below fixes
+// the two things that determine the rendered string: the prefix length (how
+// many leading hextets are pinned, hence where "::" can fall) and the interface
+// identifier's entropy. Blocks are drawn from the ranges the RIRs actually
+// allocate global unicast from, plus the special-purpose prefixes any real
+// capture contains.
+//
+// For genuinely observed addresses, pass a file instead -- see the TUM IPv6
+// Hitlist note in main(). This generator is the zero-setup approximation.
+std::vector<std::string> generate_realistic_ipv6_addresses(size_t count) {
+    struct Prefix { const char* net; int bits; int weight; };
+    // weights are rough shares of a typical capture, not measurements
+    static const Prefix prefixes[] = {
+        // global unicast, /32 allocations (the common RIR assignment size)
+        {"2001:0470::", 32, 6}, {"2001:4860::", 32, 8}, {"2001:19f0::", 32, 4},
+        {"2400:cb00::", 32, 6}, {"2600:1f00::", 32, 8}, {"2606:4700::", 32, 8},
+        {"2a00:1450::", 32, 8}, {"2a01:4f8::",  32, 5}, {"2a03:2880::", 32, 5},
+        {"2604:a880::", 32, 4},
+        // longer assignments: more pinned hextets, so shorter rendered strings
+        {"2620:00fe::",  48, 4}, {"2001:0db8:85a3::", 48, 3},
+        {"2600:1f18:6000::", 40, 3}, {"2a02:26f0:1700::", 44, 3},
+        // special purpose
+        {"fe80::",       10, 8},   // link-local
+        {"fd00::",        8, 4},   // unique local
+        {"::ffff:0:0",   96, 5},   // IPv4-mapped -- renders with dots
+        {"2001:0db8::",  32, 3},   // documentation
+        {"64:ff9b::",    96, 1},   // NAT64 -- also renders with dots
+    };
+    static const int kTotalWeight = [] {
+        int t = 0;
+        for (const auto& p : prefixes) { t += p.weight; }
+        return t;
+    }();
+
+    std::mt19937_64 gen(0x9E3779B97F4A7C15ULL);  // fixed seed: reproducible corpus
+    std::uniform_int_distribution<int> pick(0, kTotalWeight - 1);
+
+    std::vector<std::string> strings;
+    strings.reserve(count);
+    char buf[INET6_ADDRSTRLEN];
+
+    while (strings.size() < count) {
+        int r = pick(gen);
+        const Prefix* pfx = &prefixes[0];
+        for (const auto& p : prefixes) {
+            if (r < p.weight) { pfx = &p; break; }
+            r -= p.weight;
+        }
+
+        struct in6_addr addr{};
+        if (inet_pton(AF_INET6, pfx->net, &addr) != 1) { continue; }
+        uint8_t* b = addr.s6_addr;
+
+        // Interface identifier. Real captures are a mix: privacy-extension
+        // clients carry full-entropy IIDs (long hextets, no "::"), while
+        // infrastructure is overwhelmingly low-numbered (short hextets, a long
+        // "::" run). Both shapes matter -- they take different code paths.
+        const int style = (int)(gen() % 100);
+        const int host_bits = 128 - pfx->bits;
+        auto set_bit_range = [&](int from_bit, uint64_t value, int nbits) {
+            for (int i = 0; i < nbits; i++) {
+                const int bit = from_bit + nbits - 1 - i;
+                if (bit < 0 || bit >= 128) { continue; }
+                const uint8_t mask = (uint8_t)(1u << (7 - (bit & 7)));
+                if ((value >> i) & 1) { b[bit >> 3] |= mask; }
+                else                  { b[bit >> 3] &= (uint8_t)~mask; }
+            }
+        };
+
+        if (pfx->bits >= 96) {
+            // IPv4-mapped / NAT64: the low 32 bits are a v4 address
+            set_bit_range(96, gen() & 0xffffffffu, 32);
+        } else if (style < 40) {
+            // full-entropy IID (privacy extensions)
+            set_bit_range(128 - host_bits, gen(), host_bits > 64 ? 64 : host_bits);
+            if (host_bits > 64) { set_bit_range(pfx->bits, gen(), host_bits - 64); }
+        } else if (style < 80) {
+            // low / sequential host (servers, gateways, DNS resolvers)
+            set_bit_range(112, (uint64_t)(gen() % 4096), 16);
+        } else {
+            // EUI-64 from a MAC: ff:fe in the middle, universal/local bit set
+            set_bit_range(64, gen() & 0xffffffull, 24);
+            set_bit_range(88, 0xfffeu, 16);
+            set_bit_range(104, gen() & 0xffffffull, 24);
+            b[8] ^= 0x02;
+        }
+
+        if (inet_ntop(AF_INET6, &addr, buf, sizeof(buf)) == nullptr) { continue; }
+        const size_t n = std::strlen(buf);
+        if (n > 45) { continue; }  // outside the SIMD fast-path bound for every parser
+        strings.emplace_back(buf, n);
+    }
+    return strings;
+}
+
+// The composition is what makes the timings interpretable: a corpus with no
+// "::" and no dots is measuring one branch of a parser that has three.
+void describe_corpus(const std::vector<std::string>& strings) {
+    size_t total = 0, with_dc = 0, with_dot = 0;
+    for (const auto& s : strings) {
+        total += s.size();
+        if (s.find("::") != std::string::npos) { with_dc++; }
+        if (s.find('.') != std::string::npos) { with_dot++; }
+    }
+    const double n = double(strings.size());
+    std::print("  {} addresses, {:.1f} chars avg, {:.1f}% contain \"::\", {:.1f}% embed IPv4\n",
+               strings.size(), total / n, 100.0 * double(with_dc) / n,
+               100.0 * double(with_dot) / n);
+}
+
 void collect_benchmark_results(size_t number_strings) {
   benchmark_ipv6(generate_random_ipv6_addresses(number_strings));
 }
@@ -998,8 +1116,17 @@ int main(int argc, char **argv) {
 
     if (do_bench) {
         if (want("ipv6-parse")) {
+            std::vector<std::string> rnd = generate_random_ipv6_addresses(100000);
             std::print("\nIPv6 parse (random):\n");
-            collect_benchmark_results(100000);
+            describe_corpus(rnd);
+            benchmark_ipv6(rnd);
+
+            // Same parsers, a corpus shaped like real traffic. The gap between
+            // the two blocks is the point: see generate_realistic_ipv6_addresses.
+            std::vector<std::string> real_shape = generate_realistic_ipv6_addresses(100000);
+            std::print("\nIPv6 parse (realistic mix):\n");
+            describe_corpus(real_shape);
+            benchmark_ipv6(real_shape);
         }
         if (want("ipv4-parse")) {
             std::print("\nIPv4 parse (random):\n");
@@ -1018,6 +1145,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         std::print("\nIPv6 (real: {}, {} addresses):\n", datafile, real.size());
+        describe_corpus(real);
         verify_dataset(real);
         if (do_bench) { benchmark_ipv6(real); }
     }
