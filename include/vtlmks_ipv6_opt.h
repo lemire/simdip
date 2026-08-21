@@ -54,6 +54,7 @@
 #include <x86intrin.h>
 
 #include "vtlmks_ipv6.h"
+#include "avx512ip.h"   // parse_ipv4_avx512vl_strict, for embedded IPv4
 
 namespace vtlmks_opt {
 
@@ -117,12 +118,12 @@ static inline void gather_store(__m128i ends8, __m128i prev, __m512i nib, uint8_
 	                 _mm256_cvtepi16_epi8(_mm256_maddubs_epi16(gathered, k::w0110)));
 }
 
+// The two SIMD arms, with no fallback of their own: 0 means "this parser
+// declines", not "invalid". Callers decide what to do next. `out` may be
+// written speculatively even when 0 is returned.
+// Requires 2 <= len <= 45.
 __attribute__((always_inline))
-static inline int parse_ipv6_avx512_opt(const char *src, size_t len, uint8_t *out) {
-	if(len < 2 || len > 45) {
-		return vtlmks::parse_ipv6_scalar(src, len, out);
-	}
-
+static inline int parse_ipv6_core(const char *src, size_t len, uint8_t *out) {
 	const __mmask64 active = (__mmask64)_bzhi_u64(~0ull, (uint32_t)len);
 	const __m512i colon = _mm512_set1_epi8(':');
 	// Colon-filled tail: bytes at and past `len` read as ':', which makes the
@@ -157,10 +158,7 @@ static inline int parse_ipv6_avx512_opt(const char *src, size_t len, uint8_t *ou
 		kerr = _kor_mask64(kerr, (__mmask64)(uint16_t)_mm_cmpgt_epu8_mask(
 			_mm_sub_epi8(w1, k::two), k::wmax8));
 		uint64_t bad = (uint64_t)(_mm_popcnt_u64(mc & act) != 7) | (uint64_t)kerr;
-		if(bad) {
-			return vtlmks::parse_ipv6_scalar(src, len, out);
-		}
-		return 1;
+		return bad ? 0 : 1;
 	}
 
 	// "::" form: per-field end/start on the contiguous fields, drop the
@@ -201,10 +199,80 @@ static inline int parse_ipv6_avx512_opt(const char *src, size_t len, uint8_t *ou
 	bad |= _mm_cmpgt_epu8_mask(w1_full, k::five) & keepf;         // a kept group too long
 	bad |= (mc & 1ull) & ~dc;                                     // leading colon not part of "::"
 	bad |= ((mc >> (len - 1)) & 1ull) & ~(dc >> (len - 2));       // trailing colon not part of "::"
-	if(bad) {
+	return bad ? 0 : 1;
+}
+
+// An IPv6 address may write its last 32 bits as a dotted quad (RFC 4291), and
+// the SIMD arms reject the form on purpose: '.' translates to 0x80, so it trips
+// the non-hex check. Upstream then re-walks the entire string byte at a time,
+// which costs 203 cycles -- ten times the clean arm -- and on a corpus shaped
+// like real traffic that is a quarter of total time for a twentieth of the
+// input.
+//
+// "X:d.d.d.d" denotes exactly the address "X:AABB:CCDD". Rather than teach the
+// group machinery a second element size, this parses the quad with the strict
+// IPv4 fast path, rewrites those characters as two hextets, and runs the same
+// core over the result: correct by construction, and it cannot recurse because
+// the rewritten string has no dots left.
+//
+// Kept out of line so the common path never sees any of it.
+__attribute__((noinline))
+static int parse_ipv6_embedded_v4(const char *src, size_t len, uint8_t *out) {
+	const __mmask64 active = (__mmask64)_bzhi_u64(~0ull, (uint32_t)len);
+	const __m512i v = _mm512_maskz_loadu_epi8(active, src);
+	const uint64_t act = (uint64_t)active;
+	const uint64_t dots = (uint64_t)_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('.')) & act;
+	const uint64_t colons = (uint64_t)_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(':')) & act;
+	if(dots == 0 || colons == 0) {
 		return vtlmks::parse_ipv6_scalar(src, len, out);
 	}
-	return 1;
+	// The quad must be the final field: every dot after the last colon.
+	const uint32_t last_colon = 63u - (uint32_t)_lzcnt_u64(colons);
+	if((uint32_t)_tzcnt_u64(dots) <= last_colon) {
+		return vtlmks::parse_ipv6_scalar(src, len, out);
+	}
+	const size_t off = (size_t)last_colon + 1;
+	const size_t n4 = len - off;
+	uint32_t quad = 0;
+	if(n4 < 7 || n4 > 15 || !parse_ipv4_avx512vl_strict(src + off, n4, &quad)) {
+		return vtlmks::parse_ipv6_scalar(src, len, out);
+	}
+
+	// "d.d.d.d" (7..15 chars) becomes "AABB:CCDD" (9). A valid hextet prefix is
+	// at most six groups plus their colons, so the rewrite fits; anything longer
+	// is invalid anyway and goes to the reference.
+	const size_t nlen = off + 9;
+	if(nlen > 45) {
+		return vtlmks::parse_ipv6_scalar(src, len, out);
+	}
+	alignas(64) char buf[64];
+	_mm512_mask_storeu_epi8(buf, (__mmask64)_bzhi_u64(~0ull, (uint32_t)off), v);
+	static const char hexd[16] = {'0','1','2','3','4','5','6','7',
+	                              '8','9','a','b','c','d','e','f'};
+	uint8_t q[4];
+	__builtin_memcpy(q, &quad, 4);
+	char *o = buf + off;
+	o[0] = hexd[q[0] >> 4]; o[1] = hexd[q[0] & 15];
+	o[2] = hexd[q[1] >> 4]; o[3] = hexd[q[1] & 15];
+	o[4] = ':';
+	o[5] = hexd[q[2] >> 4]; o[6] = hexd[q[2] & 15];
+	o[7] = hexd[q[3] >> 4]; o[8] = hexd[q[3] & 15];
+
+	if(parse_ipv6_core(buf, nlen, out)) {
+		return 1;
+	}
+	return vtlmks::parse_ipv6_scalar(src, len, out);
+}
+
+__attribute__((always_inline))
+static inline int parse_ipv6_avx512_opt(const char *src, size_t len, uint8_t *out) {
+	if(len < 2 || len > 45) {
+		return vtlmks::parse_ipv6_scalar(src, len, out);
+	}
+	if(parse_ipv6_core(src, len, out)) {
+		return 1;
+	}
+	return parse_ipv6_embedded_v4(src, len, out);
 }
 
 }  // namespace vtlmks_opt

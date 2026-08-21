@@ -678,10 +678,13 @@ static constexpr Part part = make_part();
  * 13.27 cycles/address versus 14.52 for _notab5 and 11.68 for the 5 KB table
  * parser -- 512 bytes of table recovers about half the gap. Using 1 KB (adding
  * the leading-lane mask as a second field) is worth only a further 0.11 cycles.
+ *
+ * Returns 0 rather than deferring to ada; parse_ipv4_avx512vl_tiny below adds
+ * the fallback.
  */
-static int parse_ipv4_avx512vl_tiny(const char *input, size_t len, uint32_t *ptr) {
+static inline int parse_ipv4_avx512vl_strict(const char *input, size_t len, uint32_t *ptr) {
     namespace K = avx512vl_ipv4_k;
-    if (len > 15) [[unlikely]] { return parse_ipv4_ada(input, len, ptr); }
+    if (len > 15) [[unlikely]] { return 0; }
 
     const uint32_t len_mask = _bzhi_u32(0xFFFFFFFFu, (unsigned)len);
     const __mmask16 len_k = (__mmask16)len_mask;
@@ -723,6 +726,18 @@ static int parse_ipv4_avx512vl_tiny(const char *input, size_t len, uint32_t *ptr
         _mm_mask_cvtepi32_storeu_epi8(ptr, 0x0F, res);
         return 1;
     }
+    return 0;
+}
+
+/**
+ * Strict dotted quad, with the permissive ada fallback for the unusual-but-
+ * valid forms (octal, hex, fewer than four parts) -- the same contract as every
+ * other parser here. The strict half is exposed separately above because an
+ * IPv4 literal embedded in an IPv6 address must *not* accept those forms:
+ * inet_pton rejects "::ffff:0300.0250.0.1".
+ */
+static int parse_ipv4_avx512vl_tiny(const char *input, size_t len, uint32_t *ptr) {
+    if (parse_ipv4_avx512vl_strict(input, len, ptr)) [[likely]] { return 1; }
     return parse_ipv4_ada(input, len, ptr);
 }
 
