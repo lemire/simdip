@@ -409,6 +409,17 @@ void collect_ipv4_benchmark_results(size_t number_strings) {
     counter = c;
   };
   pretty_print("AVX-512 (no table 5)", number_strings, counters::bench(count_avx512_notab5));
+  auto count_avx512_tiny = [&strings, &counter]() {
+    size_t c = 0;
+    for (const auto& ip_str : strings) {
+        uint32_t addr = 0;
+        if (parse_ipv4_avx512vl_tiny(ip_str.data(), ip_str.size(), &addr)) {
+            c += ((const uint8_t*)&addr)[0];
+        }
+    }
+    counter = c;
+  };
+  pretty_print("AVX-512 (512-byte table)", number_strings, counters::bench(count_avx512_tiny));
   auto count_ada = [&strings, &counter]() {
     size_t c = 0;
     for (const auto& ip_str : strings) {
@@ -596,7 +607,7 @@ bool run_ipv4_tests() {
 
     for (const auto& s : standard) {
         struct in_addr ref{};
-        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_ada = 0, got_mula = 0, got_sz = 0;
+        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_tiny = 0, got_ada = 0, got_mula = 0, got_sz = 0;
         int ref_ok = inet_pton(AF_INET, s.c_str(), &ref);
         int got_ok = parse_ipv4_avx512vl(s.data(), s.size(), &got);  // masked load: safe
         int nt_ok = parse_ipv4_avx512vl_notab(s.data(), s.size(), &got_nt);
@@ -604,6 +615,7 @@ bool run_ipv4_tests() {
         int nt3_ok = parse_ipv4_avx512vl_notab3(s.data(), s.size(), &got_nt3);
         int nt4_ok = parse_ipv4_avx512vl_notab4(s.data(), s.size(), &got_nt4);
         int nt5_ok = parse_ipv4_avx512vl_notab5(s.data(), s.size(), &got_nt5);
+        int tiny_ok = parse_ipv4_avx512vl_tiny(s.data(), s.size(), &got_tiny);
         int ada_ok = parse_ipv4_ada(s.data(), s.size(), &got_ada);
         // Mula and simdzone read 16 bytes; give them a padded buffer so the
         // over-read stays in-bounds during the test.
@@ -611,7 +623,7 @@ bool run_ipv4_tests() {
         std::memcpy(buf, s.data(), s.size());
         int mula_ok = parse_ipv4_mula_sse(buf, s.size(), &got_mula);
         int sz_ok = parse_ipv4_simdzone(buf, s.size(), &got_sz);
-        if (ref_ok != 1 || got_ok != 1 || nt_ok != 1 || nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1) {
+        if (ref_ok != 1 || got_ok != 1 || nt_ok != 1 || nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1 || tiny_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1) {
             std::print("FAIL  ipv4 (standard) rejected {}\n", s);
             all_ok = false;
             continue;
@@ -622,6 +634,7 @@ bool run_ipv4_tests() {
             std::memcmp(&ref.s_addr, &got_nt3, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt4, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt5, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_tiny, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_ada, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_mula, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_sz, 4) != 0) {
@@ -633,7 +646,7 @@ bool run_ipv4_tests() {
 
     for (const auto& s : unusual) {
         struct in_addr ref{};
-        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_ada = 0;
+        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_tiny = 0, got_ada = 0;
         int ref_ok = inet_aton(s.c_str(), &ref);  // permissive reference
         int got_ok = parse_ipv4_avx512vl(s.data(), s.size(), &got);  // via fallback
         int nt_ok = parse_ipv4_avx512vl_notab(s.data(), s.size(), &got_nt);
@@ -641,6 +654,7 @@ bool run_ipv4_tests() {
         int nt3_ok = parse_ipv4_avx512vl_notab3(s.data(), s.size(), &got_nt3);
         int nt4_ok = parse_ipv4_avx512vl_notab4(s.data(), s.size(), &got_nt4);
         int nt5_ok = parse_ipv4_avx512vl_notab5(s.data(), s.size(), &got_nt5);
+        int tiny_ok = parse_ipv4_avx512vl_tiny(s.data(), s.size(), &got_tiny);
         int ada_ok = parse_ipv4_ada(s.data(), s.size(), &got_ada);
         if (ref_ok != 1) {
             std::print("FAIL  inet_aton rejected {}\n", s);
@@ -657,7 +671,7 @@ bool run_ipv4_tests() {
             all_ok = false;
             continue;
         }
-        if (nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1) {
+        if (nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1 || tiny_ok != 1) {
             std::print("FAIL  AVX-512 (no table 2) fallback rejected {}\n", s);
             all_ok = false;
             continue;
@@ -673,6 +687,7 @@ bool run_ipv4_tests() {
             std::memcmp(&ref.s_addr, &got_nt3, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt4, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt5, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_tiny, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_ada, 4) != 0) {
             std::print("FAIL  ipv4 (unusual) mismatch on {}\n", s);
             all_ok = false;
@@ -691,13 +706,14 @@ bool run_ipv4_tests() {
         "12.3..4",      // empty group / consecutive dots
     };
     for (const auto& s : malformed_groups) {
-        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_ada = 0, got_mula = 0, got_sz = 0;
+        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_tiny = 0, got_ada = 0, got_mula = 0, got_sz = 0;
         int got_ok = parse_ipv4_avx512vl(s.data(), s.size(), &got);
         int nt_ok = parse_ipv4_avx512vl_notab(s.data(), s.size(), &got_nt);
         int nt2_ok = parse_ipv4_avx512vl_notab2(s.data(), s.size(), &got_nt2);
         int nt3_ok = parse_ipv4_avx512vl_notab3(s.data(), s.size(), &got_nt3);
         int nt4_ok = parse_ipv4_avx512vl_notab4(s.data(), s.size(), &got_nt4);
         int nt5_ok = parse_ipv4_avx512vl_notab5(s.data(), s.size(), &got_nt5);
+        int tiny_ok = parse_ipv4_avx512vl_tiny(s.data(), s.size(), &got_tiny);
         int ada_ok = parse_ipv4_ada(s.data(), s.size(), &got_ada);
         char buf[16] = {0};
         std::memcpy(buf, s.data(), s.size());
@@ -711,7 +727,7 @@ bool run_ipv4_tests() {
             std::print("FAIL  AVX-512 (no table) accepted malformed {}\n", s);
             all_ok = false;
         }
-        if (nt2_ok != 0 || nt3_ok != 0 || nt4_ok != 0 || nt5_ok != 0) {
+        if (nt2_ok != 0 || nt3_ok != 0 || nt4_ok != 0 || nt5_ok != 0 || tiny_ok != 0) {
             std::print("FAIL  AVX-512 (no table 2) accepted malformed {}\n", s);
             all_ok = false;
         }
@@ -751,7 +767,7 @@ bool run_ipv4_tests() {
             uint8_t want[4] = {uint8_t(kVal[l0]), uint8_t(kVal[l1]),
                                uint8_t(kVal[l2]), uint8_t(kVal[l3])};
             struct in_addr ref{};
-            uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_ada = 0, got_mula = 0, got_sz = 0;
+            uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_tiny = 0, got_ada = 0, got_mula = 0, got_sz = 0;
             int ref_ok = inet_pton(AF_INET, std::string(s, slen).c_str(), &ref);
             int got_ok = parse_ipv4_avx512vl(s, slen, &got);
             int nt_ok = parse_ipv4_avx512vl_notab(s, slen, &got_nt);
@@ -759,12 +775,13 @@ bool run_ipv4_tests() {
             int nt3_ok = parse_ipv4_avx512vl_notab3(s, slen, &got_nt3);
             int nt4_ok = parse_ipv4_avx512vl_notab4(s, slen, &got_nt4);
             int nt5_ok = parse_ipv4_avx512vl_notab5(s, slen, &got_nt5);
+            int tiny_ok = parse_ipv4_avx512vl_tiny(s, slen, &got_tiny);
             int ada_ok = parse_ipv4_ada(s, slen, &got_ada);
             char buf[16] = {0};
             std::memcpy(buf, s, slen);
             int mula_ok = parse_ipv4_mula_sse(buf, slen, &got_mula);
             int sz_ok = parse_ipv4_simdzone(buf, slen, &got_sz);
-            if (ref_ok != 1 || got_ok != 1 || nt_ok != 1 || nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1 ||
+            if (ref_ok != 1 || got_ok != 1 || nt_ok != 1 || nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1 || tiny_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1 ||
                 std::memcmp(&ref.s_addr, want, 4) != 0 ||
                 std::memcmp(&got, want, 4) != 0 ||
                 std::memcmp(&got_nt, want, 4) != 0 ||
@@ -772,6 +789,7 @@ bool run_ipv4_tests() {
                 std::memcmp(&got_nt3, want, 4) != 0 ||
                 std::memcmp(&got_nt4, want, 4) != 0 ||
                 std::memcmp(&got_nt5, want, 4) != 0 ||
+                std::memcmp(&got_tiny, want, 4) != 0 ||
                 std::memcmp(&got_ada, want, 4) != 0 ||
                 std::memcmp(&got_mula, want, 4) != 0 ||
                 std::memcmp(&got_sz, want, 4) != 0) {
@@ -785,7 +803,7 @@ bool run_ipv4_tests() {
     // Overflow: four well-spaced digit groups, but an octet > 255.
     for (const char *s : {"256.1.1.1", "1.256.1.1", "1.1.256.1", "1.1.1.256",
                           "999.0.0.1", "1.2.3.999"}) {
-        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_ada = 0;
+        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_tiny = 0, got_ada = 0;
         if (parse_ipv4_avx512vl(s, std::strlen(s), &got) != 0) {
             std::print("FAIL  AVX-512 accepted overflow {}\n", s);
             all_ok = false;
@@ -806,6 +824,10 @@ bool run_ipv4_tests() {
             std::print("FAIL  AVX-512 (no table 5) accepted overflow {}\n", s);
             all_ok = false;
         }
+        if (parse_ipv4_avx512vl_tiny(s, std::strlen(s), &got_tiny) != 0) {
+            std::print("FAIL  AVX-512 (512-byte table) accepted overflow {}\n", s);
+            all_ok = false;
+        }
         if (parse_ipv4_ada(s, std::strlen(s), &got_ada) != 0) {
             std::print("FAIL  ada accepted overflow {}\n", s);
             all_ok = false;
@@ -816,7 +838,7 @@ bool run_ipv4_tests() {
     {
         const std::string ok_host = "12.34.56.78";
         struct in_addr ref{};
-        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_ada = 0, got_mula = 0, got_sz = 0;
+        uint32_t got = 0, got_nt = 0, got_nt2 = 0, got_nt3 = 0, got_nt4 = 0, got_nt5 = 0, got_tiny = 0, got_ada = 0, got_mula = 0, got_sz = 0;
         int ref_ok = inet_pton(AF_INET, ok_host.c_str(), &ref);
         int got_ok = parse_ipv4_avx512vl(ok_host.data(), ok_host.size(), &got);
         int nt_ok = parse_ipv4_avx512vl_notab(ok_host.data(), ok_host.size(), &got_nt);
@@ -824,18 +846,20 @@ bool run_ipv4_tests() {
         int nt3_ok = parse_ipv4_avx512vl_notab3(ok_host.data(), ok_host.size(), &got_nt3);
         int nt4_ok = parse_ipv4_avx512vl_notab4(ok_host.data(), ok_host.size(), &got_nt4);
         int nt5_ok = parse_ipv4_avx512vl_notab5(ok_host.data(), ok_host.size(), &got_nt5);
+        int tiny_ok = parse_ipv4_avx512vl_tiny(ok_host.data(), ok_host.size(), &got_tiny);
         int ada_ok = parse_ipv4_ada(ok_host.data(), ok_host.size(), &got_ada);
         char buf[16] = {0};
         std::memcpy(buf, ok_host.data(), ok_host.size());
         int mula_ok = parse_ipv4_mula_sse(buf, ok_host.size(), &got_mula);
         int sz_ok = parse_ipv4_simdzone(buf, ok_host.size(), &got_sz);
-        if (ref_ok != 1 || got_ok != 1 || nt_ok != 1 || nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1 ||
+        if (ref_ok != 1 || got_ok != 1 || nt_ok != 1 || nt2_ok != 1 || nt3_ok != 1 || nt4_ok != 1 || nt5_ok != 1 || tiny_ok != 1 || ada_ok != 1 || mula_ok != 1 || sz_ok != 1 ||
             std::memcmp(&ref.s_addr, &got, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt2, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt3, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt4, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_nt5, 4) != 0 ||
+            std::memcmp(&ref.s_addr, &got_tiny, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_ada, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_mula, 4) != 0 ||
             std::memcmp(&ref.s_addr, &got_sz, 4) != 0) {

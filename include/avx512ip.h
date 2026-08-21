@@ -620,4 +620,110 @@ static int parse_ipv4_avx512vl_notab5(const char *input, size_t len, uint32_t *p
     return parse_ipv4_ada(input, len, ptr);
 }
 
+// 512 bytes of validation table: the canonical delimiter partition for each of
+// the 81 valid layouts, indexed by the same perfect hash the table parser uses.
+// This is the *validation* half of avx512vl_ipv4::Tables -- the 4 KB shuffle
+// table is what _tiny does without.
+namespace avx512vl_ipv4_tiny {
+
+struct Part { uint16_t v[256]; };
+
+constexpr Part make_part() {
+    Part t{};
+    for (int l0 = 1; l0 <= 3; l0++)
+    for (int l1 = 1; l1 <= 3; l1++)
+    for (int l2 = 1; l2 <= 3; l2++)
+    for (int l3 = 1; l3 <= 3; l3++) {
+        const int len = l0 + l1 + l2 + l3 + 3;
+        const uint32_t partition = (1u << (uint32_t)l0) |
+                                   (1u << (uint32_t)(l0 + l1 + 1)) |
+                                   (1u << (uint32_t)(l0 + l1 + l2 + 2)) |
+                                   (1u << (uint32_t)len);
+        const uint32_t hk = (uint32_t)(partition * avx512vl_ipv4::kHashMul) >> 24;
+        if (t.v[hk] != 0) { throw "avx512vl_ipv4_tiny: perfect-hash collision"; }
+        t.v[hk] = (uint16_t)partition;
+    }
+    return t;
+}
+
+static constexpr Part part = make_part();
+
+}  // namespace avx512vl_ipv4_tiny
+
+/**
+ * _notab5's digit placement -- computed, no shuffle table -- with _notab5's
+ * *validation* replaced by one compare against a 512-byte table.
+ *
+ * The delimiter partition (three dots plus a terminator bit at `len`) hashes
+ * perfectly over the 81 valid layouts, so comparing it against the canonical
+ * value pinned for that key rejects, in a single compare, every wrong dot
+ * count, wrong dot spacing, empty octet, 4-digit octet and wrong length. That
+ * retires both of _notab5's layout checks: the `bad_gap` chain and the
+ * population count.
+ *
+ * `bad_gap` is the one that mattered. Its four instructions (`pslldq`, two
+ * `psubb`, `vpcmpub`) are all port-5 and all stacked behind `vpcompressb`, on
+ * the same port as the `vpshufb`/`vpalignr` index construction. Deleting it
+ * raises IPC from 4.00 to 4.22 -- the win is scheduling room, not instruction
+ * count.
+ *
+ * The masked load fills the tail with '.', so `delim` already carries the
+ * terminator bit at position `len`: the partition is one `lea` plus one `and`,
+ * and `dots`, `keep` and the popcount all disappear. The leading-zero test then
+ * shifts `is_digit` rather than `keep`, trading an `andn` for a second k -> GPR
+ * move, which is the cheaper side of the trade once the partition compare has
+ * taken the other general-register pressure away.
+ *
+ * Xeon Gold 6548N (Emerald Rapids), gcc 14.3, random dotted quads:
+ * 13.27 cycles/address versus 14.52 for _notab5 and 11.68 for the 5 KB table
+ * parser -- 512 bytes of table recovers about half the gap. Using 1 KB (adding
+ * the leading-lane mask as a second field) is worth only a further 0.11 cycles.
+ */
+static int parse_ipv4_avx512vl_tiny(const char *input, size_t len, uint32_t *ptr) {
+    namespace K = avx512vl_ipv4_k;
+    if (len > 15) [[unlikely]] { return parse_ipv4_ada(input, len, ptr); }
+
+    const uint32_t len_mask = _bzhi_u32(0xFFFFFFFFu, (unsigned)len);
+    const __mmask16 len_k = (__mmask16)len_mask;
+    const __m128i v = _mm_mask_loadu_epi8(K::dot, len_k, (const __m128i *)input);
+
+    const __mmask16 delim = _mm_cmpeq_epi8_mask(v, K::dot);
+
+    const __m128i digits = _mm_sub_epi8(v, K::zero);
+    const __mmask16 is_digit = _mm_cmple_epu8_mask(digits, K::nine);
+    const __mmask16 hole = _kandn_mask16(_kor_mask16(delim, is_digit), len_k);
+    const __m128i v0 = _mm_maskz_mov_epi8(is_digit, digits);
+
+    const __m128i c = _mm_maskz_compress_epi8(delim, K::iota);
+    const __m128i qi = _mm_shuffle_epi8(c, K::k_rep);
+    const __m128i prev = _mm_shuffle_epi8(_mm_alignr_epi8(c, K::ones, 15), K::k_rep);
+    const __m128i idx = _mm_max_epi8(_mm_add_epi8(qi, K::offr), prev);
+    const __m128i padded = _mm_shuffle_epi8(v0, idx);
+
+    const __mmask8 over = _mm_cmpgt_epu32_mask(padded, K::lim);
+    const __m128i res = _mm_dpbusd_epi32(_mm_setzero_si128(), padded, K::wtsr);
+
+    // `delim` already holds the terminator: the tail is '.'-filled, so bit `len`
+    // is set. Keeping bits 0..len isolates exactly (three dots + terminator).
+    const uint32_t partition = (uint32_t)delim & (uint32_t)((len_mask << 1) | 1u);
+    const uint32_t hash_key = (uint32_t)(partition * avx512vl_ipv4::kHashMul) >> 24;
+
+    // Leading zero: '0' at an octet start whose successor is a digit. The extra
+    // bit `partition` carries at position `len` sits above everything
+    // `is_digit >> 1` can contribute, so it never interferes.
+    const uint32_t start_bits = (partition << 1) | 1u;
+    const uint32_t zero_bits = (uint32_t)_mm_testn_epi8_mask(digits, digits);
+
+    const uint32_t gerr =
+        (uint32_t)(partition != avx512vl_ipv4_tiny::part.v[hash_key])
+        | (zero_bits & start_bits & ((uint32_t)is_digit >> 1));
+    const __mmask16 kerr = _kor_mask16(hole, (__mmask16)over);
+
+    if ((gerr | (uint32_t)kerr) == 0) [[likely]] {
+        _mm_mask_cvtepi32_storeu_epi8(ptr, 0x0F, res);
+        return 1;
+    }
+    return parse_ipv4_ada(input, len, ptr);
+}
+
 #endif
