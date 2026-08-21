@@ -15,6 +15,7 @@
 #include "avx512ip.h"
 #include "ada_ip.h"
 #include "vtlmks_ipv6.h"
+#include "vtlmks_ipv6_opt.h"
 #include "mula_sse_ipv4.h"
 #include "simdzone_ipv4.h"
 
@@ -173,6 +174,17 @@ void benchmark_ipv6(const std::vector<std::string>& strings) {
     counter = c;
   };
   pretty_print("AVX-512 (vtlmks)", number_strings, counters::bench(count_vtlmks));
+  auto count_vtlmks_opt = [&strings, &counter]() {
+    size_t c = 0;
+    for (const auto& ip_str : strings) {
+        struct in6_addr addr{};
+        if (vtlmks_opt::parse_ipv6_avx512_opt(ip_str.data(), ip_str.size(), addr.s6_addr)) {
+            c += addr.s6_addr[0];
+        }
+    }
+    counter = c;
+  };
+  pretty_print("AVX-512 (vtlmks, optimized)", number_strings, counters::bench(count_vtlmks_opt));
   auto count_ada = [&strings, &counter]() {
     size_t c = 0;
     for (const auto& ip_str : strings) {
@@ -263,13 +275,15 @@ std::vector<std::string> load_ipv6_addresses(const std::string& path) {
 // Real-world data is a far stronger correctness probe than the curated tests.
 void verify_dataset(const std::vector<std::string>& strings) {
     size_t pton_accept = 0;
-    size_t vtlmks_mismatch = 0, ada_mismatch = 0;
+    size_t vtlmks_mismatch = 0, vtlmks_opt_mismatch = 0, ada_mismatch = 0;
     size_t jrepp_mismatch = 0, ipaddress_mismatch = 0, boost_mismatch = 0;
     for (const auto& s : strings) {
         struct in6_addr ref{}, got_vt{}, got_ada{};
         struct in6_addr got_jr{}, got_ia{}, got_bo{};
         int ref_ok = inet_pton(AF_INET6, s.c_str(), &ref);
         int vt_ok = vtlmks::parse_ipv6_avx512(s.data(), s.size(), got_vt.s6_addr);
+        struct in6_addr got_vo{};
+        int vo_ok = vtlmks_opt::parse_ipv6_avx512_opt(s.data(), s.size(), got_vo.s6_addr);
         int ada_ok = parse_ipv6_ada(s.data(), s.size(), got_ada.s6_addr);
         int jr_ok = parse_ipv6_jrepp(s.data(), s.size(), got_jr.s6_addr);
         int ia_ok = parse_ipv6_ipaddress(s.data(), s.size(), got_ia.s6_addr);
@@ -279,6 +293,10 @@ void verify_dataset(const std::vector<std::string>& strings) {
         if ((vt_ok == 1) != ref_accept ||
             (ref_accept && std::memcmp(ref.s6_addr, got_vt.s6_addr, 16) != 0)) {
             vtlmks_mismatch++;
+        }
+        if ((vo_ok == 1) != ref_accept ||
+            (ref_accept && std::memcmp(ref.s6_addr, got_vo.s6_addr, 16) != 0)) {
+            vtlmks_opt_mismatch++;
         }
         if ((ada_ok == 1) != ref_accept ||
             (ref_accept && std::memcmp(ref.s6_addr, got_ada.s6_addr, 16) != 0)) {
@@ -300,6 +318,7 @@ void verify_dataset(const std::vector<std::string>& strings) {
     std::print("verification: {} addresses, {} accepted by inet_pton\n",
                strings.size(), pton_accept);
     std::print("  AVX-512 (vtlmks) mismatches: {}\n", vtlmks_mismatch);
+    std::print("  AVX-512 (vtlmks, optimized) mismatches: {}\n", vtlmks_opt_mismatch);
     std::print("  ada mismatches: {}\n", ada_mismatch);
     std::print("  jrepp/ipv6-parse mismatches: {}\n", jrepp_mismatch);
     std::print("  ipaddress mismatches: {}\n", ipaddress_mismatch);
@@ -554,6 +573,8 @@ bool run_tests() {
         int ref_ok = inet_pton(AF_INET6, s.c_str(), &ref);
         int ada_ok = parse_ipv6_ada(s.data(), s.size(), got_ada.s6_addr);
         int vt_ok = vtlmks::parse_ipv6_avx512(s.data(), s.size(), got_vt.s6_addr);
+        struct in6_addr got_vo{};
+        int vo_ok = vtlmks_opt::parse_ipv6_avx512_opt(s.data(), s.size(), got_vo.s6_addr);
 
         if (ref_ok != 1) {
             std::print("FAIL  inet_pton rejected {}\n", s);
@@ -570,8 +591,18 @@ bool run_tests() {
             all_ok = false;
             continue;
         }
+        if (vo_ok != 1) {
+            std::print("FAIL  vtlmks-opt rejected {}\n", s);
+            all_ok = false;
+            continue;
+        }
         if (std::memcmp(ref.s6_addr, got_ada.s6_addr, 16) != 0) {
             std::print("FAIL  ada mismatch on {}\n", s);
+            all_ok = false;
+            continue;
+        }
+        if (std::memcmp(ref.s6_addr, got_vo.s6_addr, 16) != 0) {
+            std::print("FAIL  vtlmks-opt mismatch on {}\n", s);
             all_ok = false;
             continue;
         }
