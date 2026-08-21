@@ -34,10 +34,17 @@
 //      of a general-register `& 0xff`.
 //      (+2.4% more: 17.53 -> 17.08 cycles.)
 //
-// Net on the clean arm: 20.35 -> 17.08 cycles, 72 -> 58 instructions (+16.2%).
-// The "::" arm gets +11.8% (40.37 -> 35.61 cycles) from the shared changes
-// alone; its own compress/expand and the serial general-register chain feeding
-// them are untouched and remain the larger target.
+//   4. On the "::" arm, `fields` -- and with it a colon popcount, a shift and a
+//      k -> general-register move -- is deleted from the chain that gates the
+//      expand. It exists upstream because a zero-filled tail leaves garbage
+//      widths in the lanes past the last marker; the colon fill makes those
+//      lanes contiguous tail-colon positions whose width is exactly 0, so the
+//      width test already drops them. Plus a branchless head and _bzhi, which
+//      also removes a shift-count UB when nkept > 8.
+//      ("::" arm 36.8 -> 29.5 cycles, IPC 2.81 -> 3.23.)
+//
+// Net: clean arm 20.34 -> 17.04 cycles, 72 -> 57 instructions (+16.2%);
+// "::" arm 40.33 -> 29.45 cycles, 108 -> 95 instructions (+27.1%).
 //
 // Verified against the upstream parser on 2.1M inputs (structured forms,
 // random addresses biased toward zero runs, and random junk): no mismatches.
@@ -89,6 +96,8 @@ static const __m128i lane0ff = _mm_setr_epi8(-1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 static const __m128i wmax8 = _mm_setr_epi8(3,3,3,3,3,3,3,3,-1,-1,-1,-1,-1,-1,-1,-1);
 static const __m128i two   = _mm_set1_epi8(2);
 static const __m128i one   = _mm_set1_epi8(1);
+static const __m128i five  = _mm_set1_epi8(5);
+static const __m128i minus1 = _mm_set1_epi8(-1);
 static const __m512i hi_bit = _mm512_set1_epi8((char)0x80);
 
 }  // namespace k
@@ -156,33 +165,42 @@ static inline int parse_ipv6_avx512_opt(const char *src, size_t len, uint8_t *ou
 
 	// "::" form: per-field end/start on the contiguous fields, drop the
 	// zero-width gap field(s), then expand the surviving head and tail fields
-	// into 8 slots with all-zero groups inserted at the gap. Unchanged from
-	// upstream except that real colons are `mc & act` and the gather clamps.
-	const __m128i starts_full = _mm_mask_add_epi8(_mm_setzero_si128(), 0xfffe,
-	                                              _mm_bslli_si128(comp128, 1), k::one);
-	const __m128i width_full = _mm_sub_epi8(comp128, starts_full);
+	// into 8 slots with all-zero groups inserted at the gap.
+	//
+	// `prev` is the same vector the clean arm builds, so upstream's masked add
+	// -- with its 0xfffe write mask and its splat -- is not needed; the widths
+	// come out one too large, which only shifts the two bounds below.
+	const __m128i prev_full = _mm_or_si128(_mm_bslli_si128(comp128, 1), k::lane0ff);
+	const __m128i w1_full = _mm_sub_epi8(comp128, prev_full);   // width + 1
 
-	const uint32_t p = (uint32_t)_tzcnt_u64(dc);
-	const uint32_t ncolon = (uint32_t)_mm_popcnt_u64(mc & act);
-	const uint32_t head = (p == 0) ? 0 : (uint32_t)_mm_popcnt_u64(mc & (((uint64_t)1 << p) - 1)) + 1;
-	const __mmask16 fields = (__mmask16)((1u << (ncolon + 1)) - 1);
-	const __mmask16 keepf = _mm_cmpgt_epi8_mask(width_full, _mm_setzero_si128()) & fields;
+	// Upstream masks the width test with `fields` (hence a popcount of the
+	// colons and a shift) because with a zero-filled tail the compressed lanes
+	// past the last real marker are 0 and their widths are garbage. The
+	// colon-filled tail makes those lanes *contiguous* tail-colon positions
+	// instead, so every field past the last real one has width exactly 0 and
+	// the width test drops it already. comp128's sixteen lanes are always fully
+	// populated: len is at most 45, so the tail contributes at least 19 colons.
+	// Deleting `fields` takes a k -> general-register move, a popcount and a
+	// shift out of the chain that gates the expand, and is worth 6 cycles.
+	const uint32_t head = (uint32_t)_mm_popcnt_u64(mc & (dc - 1)) + (uint32_t)(dc > 1);
+	const __mmask16 keepf = _mm_cmpgt_epi8_mask(w1_full, k::one);
 	const uint32_t nkept = (uint32_t)_mm_popcnt_u32(keepf);
 	const uint32_t zeros = 8 - nkept;
-	const __mmask16 outm = (__mmask16)(~(((1u << zeros) - 1) << head) & 0xff);
+	const __mmask16 outm = (__mmask16)(~(_bzhi_u32(0xffffffffu, zeros) << head) & 0xff);
 	const __m128i ends8 = _mm_maskz_expand_epi8(outm, _mm_maskz_compress_epi8(keepf, comp128));
-	const __m128i starts8 = _mm_maskz_expand_epi8(outm, _mm_maskz_compress_epi8(keepf, starts_full));
-	// Inserted all-zero groups have start = end = 0, so every lane clamps to -1
-	// and reads zero -- exactly the group value they need.
-	gather_store(ends8, _mm_sub_epi8(starts8, k::one), nib, out);
+	// Inserted all-zero groups need prev = -1 so their lanes clamp to byte 63,
+	// a tail colon, and read zero. A merge-masked expand supplies it for free.
+	const __m128i prev8 = _mm_mask_expand_epi8(k::minus1, outm,
+	                                           _mm_maskz_compress_epi8(keepf, prev_full));
+	gather_store(ends8, prev8, nib, out);
 
-	uint64_t bad = _mm512_movepi8_mask(v);                             // high-bit bytes
-	bad |= _mm512_movepi8_mask(nib) & ~mc;                             // non-hex
-	bad |= _blsr_u64(dc);                                              // more than one "::"
-	bad |= (uint64_t)(nkept >= 8);                                     // "::" must compress >=1 group
-	bad |= _mm_cmpgt_epu8_mask(width_full, _mm_set1_epi8(4)) & keepf;  // a kept group too long
-	bad |= (mc & 1ull) & ~dc;                                          // leading colon not part of "::"
-	bad |= ((mc >> (len - 1)) & 1ull) & ~(dc >> (len - 2));            // trailing colon not part of "::"
+	uint64_t bad = _mm512_movepi8_mask(v);                        // high-bit bytes
+	bad |= _mm512_movepi8_mask(nib) & ~mc;                        // non-hex
+	bad |= _blsr_u64(dc);                                         // more than one "::"
+	bad |= (uint64_t)(nkept >= 8);                                // "::" must compress >=1 group
+	bad |= _mm_cmpgt_epu8_mask(w1_full, k::five) & keepf;         // a kept group too long
+	bad |= (mc & 1ull) & ~dc;                                     // leading colon not part of "::"
+	bad |= ((mc >> (len - 1)) & 1ull) & ~(dc >> (len - 2));       // trailing colon not part of "::"
 	if(bad) {
 		return vtlmks::parse_ipv6_scalar(src, len, out);
 	}
