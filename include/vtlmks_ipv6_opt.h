@@ -43,8 +43,8 @@
 //      also removes a shift-count UB when nkept > 8.
 //      ("::" arm 36.8 -> 29.5 cycles, IPC 2.81 -> 3.23.)
 //
-// Net: clean arm 20.34 -> 17.04 cycles, 72 -> 57 instructions (+16.2%);
-// "::" arm 40.33 -> 29.45 cycles, 108 -> 95 instructions (+27.1%).
+// Net: clean arm 20.40 -> 16.14 cycles (+20.9%); "::" arm 40.37 -> 27.39
+// (+32.4%); embedded IPv4 202.31 -> 119.01 (+41.2%).
 //
 // Verified against the upstream parser on 2.1M inputs (structured forms,
 // random addresses biased toward zero runs, and random junk): no mismatches.
@@ -107,15 +107,21 @@ static const __m512i hi_bit = _mm512_set1_epi8((char)0x80);
 // hextets. `prev` is the byte before each group -- the colon ending the
 // previous group, or -1 for a group at offset 0 -- so a pad index clamps onto
 // a zero nibble instead of needing a write mask.
+// Plain casts, not the zeroing kind. `grp` only ever selects bytes 0..7, and
+// the zmm gather's upper 32 results are discarded, so the undefined halves are
+// never read -- and the sources here are freshly computed values already on
+// this dependency chain, so there is no false dependency for a zext to break.
+// It would only cost three vmovdqa uops per parse.
 __attribute__((always_inline))
 static inline void gather_store(__m128i ends8, __m128i prev, __m512i nib, uint8_t *out) {
-	__m256i endsb = _mm256_permutexvar_epi8(k::grp, _mm256_zextsi128_si256(ends8));
-	__m256i prevb = _mm256_permutexvar_epi8(k::grp, _mm256_zextsi128_si256(prev));
+	__m256i endsb = _mm256_permutexvar_epi8(k::grp, _mm256_castsi128_si256(ends8));
+	__m256i prevb = _mm256_permutexvar_epi8(k::grp, _mm256_castsi128_si256(prev));
 	__m256i idx = _mm256_max_epi8(_mm256_add_epi8(endsb, k::off), prevb);
 	__m256i gathered = _mm512_castsi512_si256(
-		_mm512_permutexvar_epi8(_mm512_zextsi256_si512(idx), nib));
-	_mm_storeu_si128((__m128i *)out,
-	                 _mm256_cvtepi16_epi8(_mm256_maddubs_epi16(gathered, k::w0110)));
+		_mm512_permutexvar_epi8(_mm512_castsi256_si512(idx), nib));
+	// vpmovwb straight to memory: one instruction instead of a pack and a store.
+	_mm256_mask_cvtepi16_storeu_epi8(out, 0xffff,
+	                                 _mm256_maddubs_epi16(gathered, k::w0110));
 }
 
 // The two SIMD arms, with no fallback of their own: 0 means "this parser
