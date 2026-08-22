@@ -14,6 +14,7 @@
 #include <netdb.h>       // getaddrinfo, AI_NUMERICHOST
 #include "avx512ip.h"
 #include "ada_ip.h"
+#include "ada_ipv6_head.h"
 #include "vtlmks_ipv6.h"
 #include "vtlmks_ipv6_opt.h"
 #include "mula_sse_ipv4.h"
@@ -196,7 +197,29 @@ void benchmark_ipv6(const std::vector<std::string>& strings) {
     }
     counter = c;
   };
-  pretty_print("ada", number_strings, counters::bench(count_ada));
+  pretty_print("ada (older snapshot)", number_strings, counters::bench(count_ada));
+  auto count_ada_head = [&strings, &counter]() {
+    size_t c = 0;
+    for (const auto& ip_str : strings) {
+        struct in6_addr addr{};
+        if (ada_head::parse_ipv6_ada_head(ip_str.data(), ip_str.size(), addr.s6_addr)) {
+            c += addr.s6_addr[0];
+        }
+    }
+    counter = c;
+  };
+  pretty_print("ada HEAD (AVX-512 prefilter)", number_strings, counters::bench(count_ada_head));
+  auto count_ada_head_scalar = [&strings, &counter]() {
+    size_t c = 0;
+    for (const auto& ip_str : strings) {
+        struct in6_addr addr{};
+        if (ada_head::parse_ipv6_ada_head_scalar(ip_str.data(), ip_str.size(), addr.s6_addr)) {
+            c += addr.s6_addr[0];
+        }
+    }
+    counter = c;
+  };
+  pretty_print("ada HEAD (no prefilter)", number_strings, counters::bench(count_ada_head_scalar));
   auto count_getaddrinfo = [&strings, &counter]() {
     size_t c = 0;
     for (const auto& ip_str : strings) {
@@ -395,6 +418,7 @@ void verify_dataset(const std::vector<std::string>& strings) {
     size_t pton_accept = 0;
     size_t vtlmks_mismatch = 0, vtlmks_opt_mismatch = 0, ada_mismatch = 0;
     size_t jrepp_mismatch = 0, ipaddress_mismatch = 0, boost_mismatch = 0;
+    size_t ada_head_mismatch = 0, ada_head_scalar_mismatch = 0;
     for (const auto& s : strings) {
         struct in6_addr ref{}, got_vt{}, got_ada{};
         struct in6_addr got_jr{}, got_ia{}, got_bo{};
@@ -403,6 +427,9 @@ void verify_dataset(const std::vector<std::string>& strings) {
         struct in6_addr got_vo{};
         int vo_ok = vtlmks_opt::parse_ipv6_avx512_opt(s.data(), s.size(), got_vo.s6_addr);
         int ada_ok = parse_ipv6_ada(s.data(), s.size(), got_ada.s6_addr);
+        struct in6_addr got_ah{}, got_ahs{};
+        int ah_ok = ada_head::parse_ipv6_ada_head(s.data(), s.size(), got_ah.s6_addr);
+        int ahs_ok = ada_head::parse_ipv6_ada_head_scalar(s.data(), s.size(), got_ahs.s6_addr);
         int jr_ok = parse_ipv6_jrepp(s.data(), s.size(), got_jr.s6_addr);
         int ia_ok = parse_ipv6_ipaddress(s.data(), s.size(), got_ia.s6_addr);
         int bo_ok = parse_ipv6_boost(s.data(), s.size(), got_bo.s6_addr);
@@ -419,6 +446,14 @@ void verify_dataset(const std::vector<std::string>& strings) {
         if ((ada_ok == 1) != ref_accept ||
             (ref_accept && std::memcmp(ref.s6_addr, got_ada.s6_addr, 16) != 0)) {
             ada_mismatch++;
+        }
+        if ((ah_ok == 1) != ref_accept ||
+            (ref_accept && std::memcmp(ref.s6_addr, got_ah.s6_addr, 16) != 0)) {
+            ada_head_mismatch++;
+        }
+        if ((ahs_ok == 1) != ref_accept ||
+            (ref_accept && std::memcmp(ref.s6_addr, got_ahs.s6_addr, 16) != 0)) {
+            ada_head_scalar_mismatch++;
         }
         if ((jr_ok == 1) != ref_accept ||
             (ref_accept && std::memcmp(ref.s6_addr, got_jr.s6_addr, 16) != 0)) {
@@ -438,6 +473,8 @@ void verify_dataset(const std::vector<std::string>& strings) {
     std::print("  AVX-512 (vtlmks) mismatches: {}\n", vtlmks_mismatch);
     std::print("  AVX-512 (vtlmks, optimized) mismatches: {}\n", vtlmks_opt_mismatch);
     std::print("  ada mismatches: {}\n", ada_mismatch);
+    std::print("  ada HEAD (AVX-512 prefilter) mismatches: {}\n", ada_head_mismatch);
+    std::print("  ada HEAD (no prefilter) mismatches: {}\n", ada_head_scalar_mismatch);
     std::print("  jrepp/ipv6-parse mismatches: {}\n", jrepp_mismatch);
     std::print("  ipaddress mismatches: {}\n", ipaddress_mismatch);
     std::print("  Boost.Asio mismatches: {}\n", boost_mismatch);
@@ -693,6 +730,8 @@ bool run_tests() {
         int vt_ok = vtlmks::parse_ipv6_avx512(s.data(), s.size(), got_vt.s6_addr);
         struct in6_addr got_vo{};
         int vo_ok = vtlmks_opt::parse_ipv6_avx512_opt(s.data(), s.size(), got_vo.s6_addr);
+        struct in6_addr got_ah{};
+        int ah_ok = ada_head::parse_ipv6_ada_head(s.data(), s.size(), got_ah.s6_addr);
 
         if (ref_ok != 1) {
             std::print("FAIL  inet_pton rejected {}\n", s);
@@ -714,8 +753,18 @@ bool run_tests() {
             all_ok = false;
             continue;
         }
+        if (ah_ok != 1) {
+            std::print("FAIL  ada HEAD rejected  {}\n", s);
+            all_ok = false;
+            continue;
+        }
         if (std::memcmp(ref.s6_addr, got_ada.s6_addr, 16) != 0) {
             std::print("FAIL  ada mismatch on {}\n", s);
+            all_ok = false;
+            continue;
+        }
+        if (std::memcmp(ref.s6_addr, got_ah.s6_addr, 16) != 0) {
+            std::print("FAIL  ada HEAD mismatch on {}\n", s);
             all_ok = false;
             continue;
         }
