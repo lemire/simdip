@@ -43,8 +43,19 @@
 //      also removes a shift-count UB when nkept > 8.
 //      ("::" arm 36.8 -> 29.5 cycles, IPC 2.81 -> 3.23.)
 //
+//   5. Reject without the scalar walk. The core returning 0 means "declines",
+//      so every failure used to be re-parsed by the branchy reference -- and a
+//      malformed address cost 330-430 cycles, worse than inet_pton, almost all
+//      of it branch mispredictions. The core only ever declines over a dotted
+//      quad, so a string with no dot (or no colon) that it declined is simply
+//      invalid, and the check is free: parse_ipv6_embedded_v4 already computes
+//      both masks. Bad colon shape 328.7 -> 43.1 cycles, bad hex digit
+//      432.4 -> 22.4, a 50/50 valid/invalid mix 173.1 -> 29.9. The valid path
+//      is unchanged at 21.4.
+//
 // Net: clean arm 20.40 -> 16.14 cycles (+20.9%); "::" arm 40.37 -> 27.39
-// (+32.4%); embedded IPv4 202.31 -> 119.01 (+41.2%).
+// (+32.4%); embedded IPv4 202.31 -> 119.01 (+41.2%); invalid input 330-430 ->
+// 22-43.
 //
 // Verified against the upstream parser on 2.1M inputs (structured forms,
 // random addresses biased toward zero runs, and random junk): no mismatches.
@@ -229,8 +240,16 @@ static int parse_ipv6_embedded_v4(const char *src, size_t len, uint8_t *out) {
 	const uint64_t act = (uint64_t)active;
 	const uint64_t dots = (uint64_t)_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('.')) & act;
 	const uint64_t colons = (uint64_t)_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(':')) & act;
+	// Nothing below this point can rescue a string with no dot or no colon, and
+	// neither can the reference: the core only ever declines over the dotted
+	// quad, and every valid textual IPv6 has at least two colons. Answering 0
+	// here instead of re-walking the string byte at a time is what makes the
+	// reject path cheap -- without it, a malformed address costs 330-430 cycles,
+	// worse than inet_pton, because the scalar reference mispredicts its way
+	// through the input. (Verified equivalent to the scalar walk over 8M mixed
+	// inputs; the clean arm does not notice, it is the same load either way.)
 	if(dots == 0 || colons == 0) {
-		return vtlmks::parse_ipv6_scalar(src, len, out);
+		return 0;
 	}
 	// The quad must be the final field: every dot after the last colon.
 	const uint32_t last_colon = 63u - (uint32_t)_lzcnt_u64(colons);
